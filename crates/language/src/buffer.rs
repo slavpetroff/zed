@@ -473,7 +473,7 @@ struct IndentSuggestion {
 struct BufferChunkHighlights<'a> {
     captures: SyntaxMapCaptures<'a>,
     next_capture: Option<SyntaxMapCapture<'a>>,
-    stack: Vec<(usize, usize, HighlightId)>,
+    stack: Vec<(usize, HighlightId)>,
     highlight_maps: Vec<HighlightMap>,
 }
 
@@ -518,8 +518,6 @@ pub struct Chunk<'a> {
     pub is_inlay: bool,
     /// Whether to underline the corresponding text range in the editor.
     pub underline: bool,
-    /// The byte range of the tree-sitter capture node this chunk belongs to.
-    pub capture_node_range: Option<Range<usize>>,
 }
 
 /// A set of edits to a given version of a buffer, computed asynchronously.
@@ -4813,14 +4811,13 @@ impl<'a> BufferChunks<'a> {
                 // Reuse existing highlights stack, as the new range is a subrange of the old one.
                 highlights
                     .stack
-                    .retain(|(_, end_offset, _)| *end_offset > range.start);
+                    .retain(|(end_offset, _)| *end_offset > range.start);
                 if let Some(capture) = &highlights.next_capture
                     && range.start >= capture.node.start_byte()
                 {
                     let next_capture_end = capture.node.end_byte();
                     if range.start < next_capture_end {
                         highlights.stack.push((
-                            capture.node.start_byte(),
                             next_capture_end,
                             highlights.highlight_maps[capture.grammar_index].get(capture.index),
                         ));
@@ -4939,7 +4936,7 @@ impl<'a> Iterator for BufferChunks<'a> {
         let mut next_diagnostic_endpoint = usize::MAX;
 
         if let Some(highlights) = self.highlights.as_mut() {
-            while let Some((_, parent_capture_end, _)) = highlights.stack.last() {
+            while let Some((parent_capture_end, _)) = highlights.stack.last() {
                 if *parent_capture_end <= self.range.start {
                     highlights.stack.pop();
                 } else {
@@ -4958,11 +4955,9 @@ impl<'a> Iterator for BufferChunks<'a> {
                 } else {
                     let highlight_id =
                         highlights.highlight_maps[capture.grammar_index].get(capture.index);
-                    highlights.stack.push((
-                        capture.node.start_byte(),
-                        capture.node.end_byte(),
-                        highlight_id,
-                    ));
+                    highlights
+                        .stack
+                        .push((capture.node.end_byte(), highlight_id));
                     highlights.next_capture = highlights.captures.next();
                 }
             }
@@ -4994,14 +4989,11 @@ impl<'a> Iterator for BufferChunks<'a> {
                 .min(next_capture_start)
                 .min(next_diagnostic_endpoint);
             let mut highlight_id = None;
-            let mut capture_node_range = None;
             if let Some(highlights) = self.highlights.as_ref()
-                && let Some((parent_capture_start, parent_capture_end, parent_highlight_id)) =
-                    highlights.stack.last()
+                && let Some((parent_capture_end, parent_highlight_id)) = highlights.stack.last()
             {
                 chunk_end = chunk_end.min(*parent_capture_end);
                 highlight_id = Some(*parent_highlight_id);
-                capture_node_range = Some(*parent_capture_start..*parent_capture_end);
             }
             let bit_start = chunk_start - self.chunks.offset();
             let bit_end = chunk_end - self.chunks.offset();
@@ -5020,7 +5012,6 @@ impl<'a> Iterator for BufferChunks<'a> {
             Some(Chunk {
                 text: slice,
                 syntax_highlight_id: highlight_id,
-                capture_node_range,
                 underline: self.underline,
                 diagnostic_severity: self.current_diagnostic_severity(),
                 is_unnecessary: self.current_code_is_unnecessary(),

@@ -75,8 +75,8 @@ impl VariableColorCache {
     fn generate_color_without_cache(&self, hash: u64, theme: &SyntaxTheme) -> HighlightStyle {
         let color = match self.mode {
             VariableColorMode::ThemePalette => {
-                const RAINBOW_PALETTE_SIZE: usize = 32;
-                let index = fibonacci_hash(hash, RAINBOW_PALETTE_SIZE);
+                let palette_size = theme.rainbow_palette_size();
+                let index = fibonacci_hash(hash, palette_size);
                 theme
                     .rainbow_color(index)
                     .and_then(|style| style.color)

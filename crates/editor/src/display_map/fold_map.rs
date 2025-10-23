@@ -1284,8 +1284,6 @@ pub struct Chunk<'a> {
     pub tabs: u128,
     /// Bitmap of character locations in chunk
     pub chars: u128,
-    /// The byte range of the tree-sitter capture node this chunk belongs to.
-    pub capture_node_range: Option<Range<usize>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1469,7 +1467,6 @@ impl<'a> Iterator for FoldChunks<'a> {
                 is_inlay: chunk.is_inlay,
                 underline: chunk.underline,
                 renderer: inlay_chunk.renderer,
-                capture_node_range: chunk.capture_node_range.clone(),
             });
         }
 
