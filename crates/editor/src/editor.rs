@@ -34,9 +34,9 @@ pub mod movement;
 mod persistence;
 mod rainbow; // Consolidated rainbow highlighting logic (includes caching)
 mod rust_analyzer_ext;
-mod semantic_tokens;
 pub mod scroll;
 mod selections_collection;
+mod semantic_tokens;
 pub mod tasks;
 
 #[cfg(test)]
@@ -1857,11 +1857,17 @@ impl Editor {
                             cx,
                         );
                     }
+                    project::Event::RefreshSemanticTokens(server_id) => {
+                        editor.refresh_semantic_tokens(
+                            None,
+                            project::lsp_store::semantic_token_cache::InvalidationStrategy::RefreshRequested(*server_id),
+                            cx,
+                        );
+                    }
                     project::Event::LanguageServerAdded(..) => {
                         if editor.tasks_update_task.is_none() {
                             editor.tasks_update_task = Some(editor.refresh_runnables(window, cx));
                         }
-                        // Semantic tokens are requested via update_lsp_data when buffers are registered
                     }
                     project::Event::LanguageServerRemoved(..) => {
                         if editor.tasks_update_task.is_none() {
@@ -1869,6 +1875,11 @@ impl Editor {
                         }
                         editor.registered_buffers.clear();
                         editor.register_visible_buffers(cx);
+                        editor.refresh_semantic_tokens(
+                            None,
+                            project::lsp_store::semantic_token_cache::InvalidationStrategy::BufferEdited,
+                            cx,
+                        );
                     }
                     project::Event::SnippetEdit(id, snippet_edits) => {
                         if let Some(buffer) = editor.buffer.read(cx).buffer(*id) {
@@ -1899,14 +1910,22 @@ impl Editor {
                             refresh_linked_ranges(editor, window, cx);
                             editor.refresh_code_actions(window, cx);
                             editor.refresh_document_highlights(cx);
-                            editor.refresh_semantic_tokens(Some(buffer_id), cx);
+                            editor.refresh_semantic_tokens(
+                                Some(buffer_id),
+                                project::lsp_store::semantic_token_cache::InvalidationStrategy::None,
+                                cx,
+                            );
                         }
                     }
 
                     project::Event::LanguageServerIndexingComplete {
                         language_server_id: _,
                     } => {
-                        editor.refresh_semantic_tokens(None, cx);
+                        editor.refresh_semantic_tokens(
+                            None,
+                            project::lsp_store::semantic_token_cache::InvalidationStrategy::BufferEdited,
+                            cx,
+                        );
                     }
 
                     project::Event::EntryRenamed(transaction) => {
@@ -20893,7 +20912,11 @@ impl Editor {
                             InlayHintRefreshReason::BufferEdited(buffer_id),
                             cx,
                         );
-                        self.refresh_semantic_tokens(Some(buffer_id), cx);
+                        self.refresh_semantic_tokens(
+                            Some(buffer_id),
+                            project::lsp_store::semantic_token_cache::InvalidationStrategy::BufferEdited,
+                            cx,
+                        );
                     }
                 }
 
@@ -20933,7 +20956,11 @@ impl Editor {
                 self.register_buffer(buffer_id, cx);
                 self.update_lsp_data(Some(buffer_id), window, cx);
                 self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
-                self.refresh_semantic_tokens(Some(buffer_id), cx);
+                self.refresh_semantic_tokens(
+                    Some(buffer_id),
+                    project::lsp_store::semantic_token_cache::InvalidationStrategy::None,
+                    cx,
+                );
 
                 cx.emit(EditorEvent::ExcerptsAdded {
                     buffer: buffer.clone(),
@@ -20975,6 +21002,11 @@ impl Editor {
             multi_buffer::Event::ExcerptsExpanded { ids } => {
                 self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
                 self.refresh_document_highlights(cx);
+                self.refresh_semantic_tokens(
+                    None,
+                    project::lsp_store::semantic_token_cache::InvalidationStrategy::None,
+                    cx,
+                );
                 cx.emit(EditorEvent::ExcerptsExpanded { ids: ids.clone() })
             }
             multi_buffer::Event::Reparsed(buffer_id) => {
@@ -20988,7 +21020,11 @@ impl Editor {
                 self.registered_buffers.remove(&buffer_id);
                 self.register_buffer(*buffer_id, cx);
                 self.update_lsp_data(Some(*buffer_id), window, cx);
-                self.refresh_semantic_tokens(Some(*buffer_id), cx);
+                self.refresh_semantic_tokens(
+                    Some(*buffer_id),
+                    project::lsp_store::semantic_token_cache::InvalidationStrategy::BufferEdited,
+                    cx,
+                );
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
                 cx.notify();
@@ -21050,7 +21086,6 @@ impl Editor {
         cx.notify();
     }
 
-
     fn settings_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.diagnostics_enabled() {
             let new_severity = EditorSettings::get_global(cx)
@@ -21094,7 +21129,11 @@ impl Editor {
 
         if rainbow_changed || max_lines_changed {
             self.last_semantic_tokens_max_lines = semantic_tokens_max_lines;
-            self.refresh_semantic_tokens(None, cx);
+            self.refresh_semantic_tokens(
+                None,
+                project::lsp_store::semantic_token_cache::InvalidationStrategy::BufferEdited,
+                cx,
+            );
         }
 
         let old_cursor_shape = self.cursor_shape;
@@ -22036,7 +22075,12 @@ impl Editor {
         }
     }
 
-    fn refresh_semantic_tokens(&mut self, for_buffer: Option<BufferId>, cx: &mut Context<Self>) {
+    fn refresh_semantic_tokens(
+        &mut self,
+        for_buffer: Option<BufferId>,
+        invalidation: project::lsp_store::semantic_token_cache::InvalidationStrategy,
+        cx: &mut Context<Self>,
+    ) {
         let Some(project) = self.project.as_ref() else {
             return;
         };
@@ -22143,7 +22187,7 @@ impl Editor {
                                         .update(cx, |project, cx| {
                                             project
                                                 .lsp_store()
-                                                .update(cx, |store, cx| store.semantic_tokens(buffer, cx))
+                                                .update(cx, |store, cx| store.semantic_tokens(buffer, invalidation, cx))
                                         })
                                         .log_err()
                                     else {
@@ -23427,7 +23471,14 @@ impl SemanticsProvider for Entity<Project> {
         buffer_handle: Entity<Buffer>,
         cx: &mut App,
     ) -> Option<Task<anyhow::Result<Arc<SemanticTokens>>>> {
-        Some(self.update(cx, |project, cx| project.semantic_tokens(buffer_handle, cx)))
+        Some(self.update(cx, |project, cx| {
+            // Default to no invalidation when called from DisplayMap
+            project.semantic_tokens(
+                buffer_handle,
+                project::lsp_store::semantic_token_cache::InvalidationStrategy::None,
+                cx,
+            )
+        }))
     }
 
     fn inlay_hints(

@@ -503,6 +503,11 @@ message RefreshInlayHints {
     uint64 server_id = 2;
 }
 
+message RefreshSemanticTokens {
+    uint64 project_id = 1;
+    uint64 server_id = 2;
+}
+
 message CodeLens {
     bytes lsp_lens = 1;
 }

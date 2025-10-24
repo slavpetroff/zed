@@ -36,7 +36,6 @@ pub use block_map::{
     StickyHeaderExcerpt,
 };
 use block_map::{BlockRow, BlockSnapshot};
-use clock::Global;
 use collections::{HashMap, HashSet};
 pub use crease_map::*;
 use fold_map::FoldSnapshot;

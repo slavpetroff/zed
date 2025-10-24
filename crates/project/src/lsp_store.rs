@@ -18,8 +18,10 @@ pub mod semantic_tokens;
 pub mod vue_language_server_ext;
 
 mod inlay_hint_cache;
+pub mod semantic_token_cache;
 
 use self::inlay_hint_cache::BufferInlayHints;
+use self::semantic_token_cache::InvalidationStrategy as SemanticTokensInvalidationStrategy;
 use crate::{
     CodeAction, ColorPresentation, Completion, CompletionDisplayOptions, CompletionResponse,
     CompletionSource, CoreCompletion, DocumentColor, Hover, InlayHint, InlayId, LocationLink,
@@ -838,6 +840,32 @@ impl LocalLspStore {
                                     project_id: *project_id,
                                 })
                             })
+                        })?
+                        .transpose()?;
+                        Ok(())
+                    }
+                }
+            })
+            .detach();
+
+        language_server
+            .on_request::<lsp::request::SemanticTokensRefresh, _, _>({
+                let lsp_store = lsp_store.clone();
+                move |(), cx| {
+                    let this = lsp_store.clone();
+                    let mut cx = cx.clone();
+                    async move {
+                        this.update(&mut cx, |lsp_store, cx| {
+                            cx.emit(LspStoreEvent::RefreshSemanticTokens(server_id));
+                            lsp_store
+                                .downstream_client
+                                .as_ref()
+                                .map(|(client, project_id)| {
+                                    client.send(proto::RefreshSemanticTokens {
+                                        project_id: *project_id,
+                                        server_id: server_id.to_proto(),
+                                    })
+                                })
                         })?
                         .transpose()?;
                         Ok(())
@@ -3617,6 +3645,7 @@ pub enum LspStoreEvent {
     Notification(String),
     RefreshInlayHints(LanguageServerId),
     RefreshCodeLens,
+    RefreshSemanticTokens(LanguageServerId),
     DiagnosticsUpdated {
         server_id: LanguageServerId,
         paths: Vec<ProjectPath>,
@@ -3704,6 +3733,7 @@ impl LspStore {
         client.add_entity_request_handler(Self::handle_open_buffer_for_symbol);
         client.add_entity_request_handler(Self::handle_refresh_inlay_hints);
         client.add_entity_request_handler(Self::handle_refresh_code_lens);
+        client.add_entity_request_handler(Self::handle_refresh_semantic_tokens);
         client.add_entity_request_handler(Self::handle_on_type_formatting);
         client.add_entity_request_handler(Self::handle_apply_additional_edits_for_completion);
         client.add_entity_request_handler(Self::handle_register_buffer_with_language_servers);
@@ -6834,16 +6864,27 @@ impl LspStore {
     pub fn semantic_tokens(
         &mut self,
         buffer: Entity<Buffer>,
+        invalidate: SemanticTokensInvalidationStrategy,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Arc<SemanticTokens>>> {
         let buffer_id = buffer.read(cx).remote_id();
         
-        // Check if we have cached tokens with a result_id and can request delta
-        let result_id = self
-            .latest_lsp_data(&buffer, cx)
-            .semantic_tokens
-            .as_ref()
-            .and_then(|data| data.result_id.clone());
+        // Check if we should use cached tokens or request delta
+        let should_invalidate = invalidate.should_invalidate();
+        let _for_server = if let SemanticTokensInvalidationStrategy::RefreshRequested(server_id) = invalidate {
+            Some(server_id)
+        } else {
+            None
+        };
+
+        let result_id = if !should_invalidate {
+            self.latest_lsp_data(&buffer, cx)
+                .semantic_tokens
+                .as_ref()
+                .and_then(|data| data.result_id.clone())
+        } else {
+            None
+        };
 
         if let Some(result_id) = result_id {
             if self.is_capable_for_proto_request(
@@ -9856,6 +9897,19 @@ impl LspStore {
     ) -> Result<proto::Ack> {
         lsp_store.update(&mut cx, |_, cx| {
             cx.emit(LspStoreEvent::RefreshInlayHints(
+                LanguageServerId::from_proto(envelope.payload.server_id),
+            ));
+        })?;
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_refresh_semantic_tokens(
+        lsp_store: Entity<Self>,
+        envelope: TypedEnvelope<proto::RefreshSemanticTokens>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        lsp_store.update(&mut cx, |_, cx| {
+            cx.emit(LspStoreEvent::RefreshSemanticTokens(
                 LanguageServerId::from_proto(envelope.payload.server_id),
             ));
         })?;

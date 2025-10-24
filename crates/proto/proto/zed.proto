@@ -431,7 +431,8 @@ message Envelope {
         GetTreeDiffResponse get_tree_diff_response = 389;
 
         GetBlobContent get_blob_content = 390;
-        GetBlobContentResponse get_blob_content_response = 391; // current max
+        GetBlobContentResponse get_blob_content_response = 391;
+        RefreshSemanticTokens refresh_semantic_tokens = 392; // current max
     }
 
     reserved 87 to 88;

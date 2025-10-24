@@ -339,6 +339,7 @@ pub enum Event {
     Rejoined,
     RefreshInlayHints(LanguageServerId),
     RefreshCodeLens,
+    RefreshSemanticTokens(LanguageServerId),
     LanguageServerIndexingComplete {
         language_server_id: LanguageServerId,
     },
@@ -3081,6 +3082,9 @@ impl Project {
                 cx.emit(Event::RefreshInlayHints(*server_id))
             }
             LspStoreEvent::RefreshCodeLens => cx.emit(Event::RefreshCodeLens),
+            LspStoreEvent::RefreshSemanticTokens(server_id) => {
+                cx.emit(Event::RefreshSemanticTokens(*server_id))
+            }
             LspStoreEvent::LanguageServerIndexingComplete { language_server_id } => {
                 cx.emit(Event::LanguageServerIndexingComplete {
                     language_server_id: *language_server_id,
@@ -4010,10 +4014,11 @@ impl Project {
     pub fn semantic_tokens(
         &mut self,
         buffer_handle: Entity<Buffer>,
+        invalidate: lsp_store::semantic_token_cache::InvalidationStrategy,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Arc<SemanticTokens>>> {
         self.lsp_store.update(cx, |lsp_store, cx| {
-            lsp_store.semantic_tokens(buffer_handle, cx)
+            lsp_store.semantic_tokens(buffer_handle, invalidate, cx)
         })
     }
 
