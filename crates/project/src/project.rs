@@ -4018,7 +4018,7 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Arc<SemanticTokens>>> {
         self.lsp_store.update(cx, |lsp_store, cx| {
-            lsp_store.semantic_tokens(buffer_handle, invalidate, cx)
+            lsp_store.semantic_tokens(buffer_handle, None, invalidate, cx)
         })
     }
 

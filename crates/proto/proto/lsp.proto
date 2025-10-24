@@ -181,6 +181,14 @@ message SemanticTokensEdit {
     repeated uint32 data = 3;
 }
 
+message GetSemanticTokensRange {
+    uint64 project_id = 1;
+    uint64 buffer_id = 2;
+    repeated VectorClockEntry version = 3;
+    optional Anchor start = 4;
+    optional Anchor end = 5;
+}
+
 message PointUtf16 {
     uint32 row = 1;
     uint32 column = 2;

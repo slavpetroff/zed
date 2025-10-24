@@ -5259,6 +5259,31 @@ impl Editor {
         cx.notify();
     }
 
+    fn extract_visible_ranges_for_buffer(
+        &self,
+        buffer_id: BufferId,
+        cx: &mut Context<Self>,
+    ) -> Option<Vec<Range<text::Anchor>>> {
+        let visible_excerpts = self.visible_excerpts(cx);
+        let ranges: Vec<Range<text::Anchor>> = visible_excerpts
+            .into_values()
+            .filter_map(|(buffer, _, range)| {
+                if buffer.read(cx).remote_id() == buffer_id {
+                    let snapshot = buffer.read(cx).snapshot();
+                    Some(snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        if ranges.is_empty() {
+            None
+        } else {
+            Some(ranges)
+        }
+    }
+
     pub fn visible_excerpts(
         &self,
         cx: &mut Context<Editor>,
@@ -22183,13 +22208,16 @@ impl Editor {
                                 }
                                 editor.pending_semantic_token_requests.insert(buffer_id);
 
+                                // Extract visible ranges for this buffer
+                                let visible_ranges = editor.extract_visible_ranges_for_buffer(buffer_id, cx);
+                                
                                 let project = project.clone();
                                 let task = cx.spawn(async move |editor, cx| {
                                     let Some(lsp_task) = project
                                         .update(cx, |project, cx| {
                                             project
                                                 .lsp_store()
-                                                .update(cx, |store, cx| store.semantic_tokens(buffer, invalidation, cx))
+                                                .update(cx, |store, cx| store.semantic_tokens(buffer, visible_ranges, invalidation, cx))
                                         })
                                         .log_err()
                                     else {
