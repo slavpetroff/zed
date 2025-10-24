@@ -425,7 +425,13 @@ message Envelope {
         SemanticTokensFull semantic_tokens_full = 384;
         SemanticTokensFullResponse semantic_tokens_full_response = 385;
         SemanticTokensDelta semantic_tokens_delta = 386;
-        SemanticTokensDeltaResponse semantic_tokens_delta_response = 387; // current max
+        SemanticTokensDeltaResponse semantic_tokens_delta_response = 387;
+
+        GetTreeDiff get_tree_diff = 388;
+        GetTreeDiffResponse get_tree_diff_response = 389;
+
+        GetBlobContent get_blob_content = 390;
+        GetBlobContentResponse get_blob_content_response = 391; // current max
     }
 
     reserved 87 to 88;
