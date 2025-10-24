@@ -34,6 +34,7 @@ pub mod movement;
 mod persistence;
 mod rainbow; // Consolidated rainbow highlighting logic (includes caching)
 mod rust_analyzer_ext;
+mod semantic_tokens;
 pub mod scroll;
 mod selections_collection;
 pub mod tasks;
@@ -2209,7 +2210,6 @@ impl Editor {
                         cx.observe(&multi_buffer, Self::on_buffer_changed),
                         cx.subscribe_in(&multi_buffer, window, Self::on_buffer_event),
                         cx.observe_in(&display_map, window, Self::on_display_map_changed),
-                        cx.subscribe_in(&display_map, window, Self::on_display_map_event),
                         cx.observe(&blink_manager, |_, _, cx| cx.notify()),
                         cx.observe_global_in::<SettingsStore>(window, Self::settings_changed),
                         observe_buffer_font_size_adjustment(cx, |_, cx| cx.notify()),
@@ -21050,19 +21050,6 @@ impl Editor {
         cx.notify();
     }
 
-    fn on_display_map_event(
-        &mut self,
-        _: &Entity<DisplayMap>,
-        event: &display_map::DisplayMapEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            display_map::DisplayMapEvent::SemanticTokensReady { buffer_id: _ } => {
-                cx.notify(); // Force editor to redraw with new semantic tokens
-            }
-        }
-    }
 
     fn settings_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.diagnostics_enabled() {

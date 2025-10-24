@@ -28,6 +28,7 @@ mod wrap_map;
 
 use crate::{
     EditorStyle, RowExt, hover_links::InlayHighlight, inlays::Inlay, movement::TextLayoutDetails,
+    semantic_tokens::SemanticTokenBufferContainer,
 };
 pub use block_map::{
     Block, BlockChunks as DisplayChunks, BlockContext, BlockId, BlockMap, BlockPlacement,
@@ -51,6 +52,7 @@ pub use invisibles::{is_invisible, replacement};
 use language::{
     OffsetUtf16, Point, Subscription as BufferSubscription, language_settings::language_settings,
 };
+use lsp::SemanticTokenType;
 use multi_buffer::{
     Anchor, AnchorRangeExt, ExcerptId, MultiBuffer, MultiBufferPoint, MultiBufferRow,
     MultiBufferSnapshot, RowInfo, ToOffset, ToPoint,
@@ -61,7 +63,6 @@ use project::{
 };
 use serde::Deserialize;
 use settings::Settings;
-use theme::SyntaxTheme;
 use util::ResultExt;
 
 use std::{
@@ -101,11 +102,6 @@ pub trait ToDisplayPoint {
 type TextHighlights = TreeMap<HighlightKey, Arc<(HighlightStyle, Vec<Range<Anchor>>)>>;
 type InlayHighlights = TreeMap<TypeId, TreeMap<InlayId, (HighlightStyle, InlayHighlight)>>;
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum DisplayMapEvent {
-    SemanticTokensReady { buffer_id: BufferId },
-}
-
 /// Decides how text in a [`MultiBuffer`] should be displayed in a buffer, handling inlay hints,
 /// folding, hard tabs, soft wrapping, custom blocks (like diagnostics), and highlighting.
 ///
@@ -129,7 +125,7 @@ pub struct DisplayMap {
     /// Regions of inlays that should be highlighted.
     inlay_highlights: InlayHighlights,
     /// The semantic tokens from the language server.
-    pub semantic_tokens: HashMap<BufferId, Arc<SemanticTokenView>>,
+    pub semantic_tokens: HashMap<BufferId, Arc<SemanticTokenBufferContainer>>,
     /// Cache for rainbow variable coloring (owned by DisplayMap, snapshot via Arc).
     /// Uses DashMap internally for lock-free concurrent access.
     variable_color_cache: Option<Arc<crate::rainbow::VariableColorCache>>,
@@ -144,26 +140,6 @@ pub struct DisplayMap {
     _project_subscription: Option<Subscription>,
     /// Pending semantic token tasks - storing cancels previous task when new response arrives
     pending_semantic_token_tasks: HashMap<BufferId, gpui::Task<()>>,
-}
-
-#[derive(Debug, Default)]
-pub struct SemanticTokenView {
-    pub tokens: Vec<MultibufferSemanticToken>,
-    pub version: Global,
-    /// Tracks whether this view was generated with rainbow cache available.
-    /// Used to detect when tokens need regeneration due to rainbow highlighting toggle.
-    pub had_rainbow_cache: bool,
-}
-
-/// A `SemanticToken`, but attached to a `MultiBuffer`.
-#[derive(Debug)]
-pub struct MultibufferSemanticToken {
-    pub range: Range<usize>,
-    pub style: HighlightStyle,
-
-    // These are only used in the debug syntax tree.
-    pub lsp_type: u32,
-    pub lsp_modifiers: u32,
 }
 
 impl DisplayMap {
@@ -760,7 +736,7 @@ impl DisplayMap {
             let view = cx
                 .background_executor()
                 .spawn(async move {
-                    SemanticTokenView::new(
+                    SemanticTokenBufferContainer::new(
                         &buffer_snapshot,
                         &tokens,
                         &legend,
@@ -785,7 +761,6 @@ impl DisplayMap {
                     this.semantic_tokens.insert(buffer_id, view_arc);
 
                     if should_notify {
-                        cx.emit(DisplayMapEvent::SemanticTokensReady { buffer_id });
                         cx.notify();
                     }
                 })
@@ -804,13 +779,11 @@ impl DisplayMap {
     }
 }
 
-impl gpui::EventEmitter<DisplayMapEvent> for DisplayMap {}
-
 #[derive(Debug, Default)]
 pub(crate) struct Highlights<'a> {
     pub text_highlights: Option<&'a TextHighlights>,
     pub inlay_highlights: Option<&'a InlayHighlights>,
-    pub semantic_tokens: Option<&'a HashMap<BufferId, Arc<SemanticTokenView>>>,
+    pub semantic_tokens: Option<&'a HashMap<BufferId, Arc<SemanticTokenBufferContainer>>>,
     pub styles: HighlightStyles,
 }
 
@@ -944,7 +917,7 @@ pub struct DisplaySnapshot {
     block_snapshot: BlockSnapshot,
     text_highlights: TextHighlights,
     inlay_highlights: InlayHighlights,
-    semantic_tokens: HashMap<BufferId, Arc<SemanticTokenView>>,
+    semantic_tokens: HashMap<BufferId, Arc<SemanticTokenBufferContainer>>,
     variable_color_cache: Option<Arc<crate::rainbow::VariableColorCache>>,
     clip_at_line_ends: bool,
     masked: bool,
@@ -1770,304 +1743,6 @@ impl ToDisplayPoint for Point {
 impl ToDisplayPoint for Anchor {
     fn to_display_point(&self, map: &DisplaySnapshot) -> DisplayPoint {
         self.to_point(map.buffer_snapshot()).to_display_point(map)
-    }
-}
-impl SemanticTokenView {
-    pub fn new(
-        buffer_snapshot: &language::BufferSnapshot,
-        lsp: &SemanticTokens,
-        legend: &lsp::SemanticTokensLegend,
-        variable_color_cache: Option<&Arc<crate::rainbow::VariableColorCache>>,
-        syntax_theme: Option<&theme::SyntaxTheme>,
-        rainbow_config: crate::editor_settings::RainbowConfig,
-    ) -> Option<SemanticTokenView> {
-        let highlights_config = buffer_snapshot
-            .language()
-            .and_then(|lang| lang.grammar())
-            .and_then(|grammar| grammar.highlights_config.as_ref());
-        let stylizer = SemanticTokenStylizer::new(legend, &rainbow_config);
-
-        let mut tokens = lsp
-            .tokens()
-            .filter_map(|token| {
-                let start = text::Unclipped(text::PointUtf16::new(token.line, token.start));
-                let (start_offset, end_offset) = point_offset_to_offsets(
-                    buffer_snapshot.clip_point_utf16(start, Bias::Left),
-                    text::OffsetUtf16(token.length as usize),
-                    &buffer_snapshot.text,
-                );
-
-                let style = stylizer.convert(
-                    syntax_theme,
-                    token.token_type,
-                    token.token_modifiers,
-                    &buffer_snapshot.text,
-                    start_offset..end_offset,
-                    variable_color_cache,
-                    highlights_config,
-                )?;
-
-                Some(MultibufferSemanticToken {
-                    range: start_offset..end_offset,
-                    style,
-                    lsp_type: token.token_type,
-                    lsp_modifiers: token.token_modifiers,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        // These should be sorted, but we rely on it for binary searching, so let's be sure.
-        tokens.sort_by_key(|token| token.range.start);
-
-        Some(SemanticTokenView {
-            tokens,
-            version: buffer_snapshot.version().clone(),
-            had_rainbow_cache: variable_color_cache.is_some(),
-        })
-    }
-
-    pub fn tokens_in_range(&self, range: Range<usize>) -> &[MultibufferSemanticToken] {
-        let start = self
-            .tokens
-            .binary_search_by_key(&range.start, |token| token.range.start)
-            .unwrap_or_else(|next_ix| next_ix);
-
-        let end = self
-            .tokens
-            .binary_search_by_key(&range.end, |token| token.range.start)
-            .unwrap_or_else(|next_ix| next_ix);
-
-        &self.tokens[start..end]
-    }
-}
-
-fn point_offset_to_offsets(
-    point: text::PointUtf16,
-    length: text::OffsetUtf16,
-    buffer: &text::BufferSnapshot,
-) -> (usize, usize) {
-    let start = buffer.as_rope().point_utf16_to_offset(point);
-    let start_offset = buffer.as_rope().offset_to_offset_utf16(start);
-    let end_offset = start_offset + length;
-    let end = buffer.as_rope().offset_utf16_to_offset(end_offset);
-
-    (start, end)
-}
-
-/// Stylizer for LSP semantic tokens with encapsulated rainbow highlighting logic.
-///
-/// Architecture: The convert method extracts variable names from the buffer and applies
-/// rainbow colors when enabled, following SOLID principles by keeping all token styling
-/// logic in one place.
-struct SemanticTokenStylizer<'a> {
-    token_types: Vec<&'a str>,
-    modifier_mask: HashMap<&'a str, u32>,
-    rainbow_enabled: bool,
-    rainbow_token_types: &'a [crate::editor_settings::RainbowTokenType],
-}
-
-impl<'a> SemanticTokenStylizer<'a> {
-    pub fn new(
-        legend: &'a lsp::SemanticTokensLegend,
-        rainbow_config: &'a crate::editor_settings::RainbowConfig,
-    ) -> Self {
-        let token_types = legend.token_types.iter().map(|s| s.as_str()).collect();
-        let modifier_mask = legend
-            .token_modifiers
-            .iter()
-            .enumerate()
-            .map(|(i, modifier)| (modifier.as_str(), 1 << i))
-            .collect();
-        SemanticTokenStylizer {
-            token_types,
-            modifier_mask,
-            rainbow_enabled: rainbow_config.enabled,
-            rainbow_token_types: &rainbow_config.token_types,
-        }
-    }
-
-    pub fn token_type(&self, token_type: u32) -> Option<&'a str> {
-        self.token_types.get(token_type as usize).copied()
-    }
-
-    pub fn has_modifier(&self, token_modifiers: u32, modifier: &str) -> bool {
-        let Some(mask) = self.modifier_mask.get(modifier) else {
-            return false;
-        };
-        (token_modifiers & mask) != 0
-    }
-
-    /// Try to apply rainbow highlighting to an identifier if cache is available.
-    /// Returns Some(style) if rainbow color was applied, None otherwise.
-    fn try_apply_rainbow(
-        &self,
-        buffer: &text::BufferSnapshot,
-        range: Range<usize>,
-        variable_color_cache: Option<&Arc<crate::rainbow::VariableColorCache>>,
-        theme: Option<&'a SyntaxTheme>,
-    ) -> Option<HighlightStyle> {
-        let cache = variable_color_cache?;
-        let theme = theme?;
-        let identifier: String = buffer.text_for_range(range).collect();
-        let validated = crate::rainbow::validate_identifier_for_rainbow(&identifier)?;
-        let style = cache.get_or_insert(validated, theme);
-        style.color.as_ref()?;
-        Some(style)
-    }
-
-    pub fn convert(
-        &self,
-        theme: Option<&'a SyntaxTheme>,
-        token_type: u32,
-        modifiers: u32,
-        buffer: &text::BufferSnapshot,
-        range: Range<usize>,
-        variable_color_cache: Option<&Arc<crate::rainbow::VariableColorCache>>,
-        _highlights_config: Option<&language::HighlightsConfig>,
-    ) -> Option<HighlightStyle> {
-        let token_type_name = self.token_type(token_type)?;
-        let has_modifier = |modifier| self.has_modifier(modifiers, modifier);
-
-        // Early return: try rainbow highlighting for eligible token types
-        // This keeps rainbow logic separate from theme color mapping
-        if self.rainbow_enabled && variable_color_cache.is_some() && theme.is_some() {
-            let should_apply_rainbow =
-                self.rainbow_token_types
-                    .iter()
-                    .any(|rainbow_type| match rainbow_type {
-                        crate::editor_settings::RainbowTokenType::Parameter => {
-                            token_type_name == "parameter"
-                        }
-                        crate::editor_settings::RainbowTokenType::Variable => {
-                            token_type_name == "variable"
-                                && !has_modifier("defaultLibrary")
-                                && !has_modifier("constant")
-                        }
-                        crate::editor_settings::RainbowTokenType::Property => {
-                            token_type_name == "property"
-                        }
-                    });
-
-            if should_apply_rainbow {
-                if let Some(style) =
-                    self.try_apply_rainbow(buffer, range, variable_color_cache, theme)
-                {
-                    return Some(style);
-                }
-            }
-        }
-
-        let choices: &[&str] = match token_type_name {
-            // Types
-            "namespace" => &["namespace", "module", "type"],
-            "class" if has_modifier("declaration") || has_modifier("definition") => &[
-                "type.class.definition",
-                "type.definition",
-                "type.class",
-                "class",
-                "type",
-            ],
-            "class" => &["type.class", "class", "type"],
-            "enum" if has_modifier("declaration") || has_modifier("definition") => &[
-                "type.enum.definition",
-                "type.definition",
-                "type.enum",
-                "enum",
-                "type",
-            ],
-            "enum" => &["type.enum", "enum", "type"],
-            "interface" if has_modifier("declaration") || has_modifier("definition") => &[
-                "type.interface.definition",
-                "type.definition",
-                "type.interface",
-                "interface",
-                "type",
-            ],
-            "interface" => &["type.interface", "interface", "type"],
-            "struct" if has_modifier("declaration") || has_modifier("definition") => &[
-                "type.struct.definition",
-                "type.definition",
-                "type.struct",
-                "struct",
-                "type",
-            ],
-            "struct" => &["type.struct", "struct", "type"],
-            "typeParameter" if has_modifier("declaration") || has_modifier("definition") => &[
-                "type.parameter.definition",
-                "type.definition",
-                "type.parameter",
-                "type",
-            ],
-            "typeParameter" => &["type.parameter", "type"],
-            "type" if has_modifier("declaration") || has_modifier("definition") => {
-                &["type.definition", "type"]
-            }
-            "type" => &["type"],
-
-            // References
-            "parameter" => &["parameter"],
-            "variable" if has_modifier("defaultLibrary") && has_modifier("constant") => {
-                &["constant.builtin", "constant"]
-            }
-            "variable" if has_modifier("defaultLibrary") => &["variable.builtin", "variable"],
-            "variable" if has_modifier("constant") => &["constant"],
-            "variable" => &["variable"],
-            "const" => &["const", "constant", "variable"],
-            "property" => &["property"],
-            "enumMember" => &["type.enum.member", "type.enum", "variant"],
-            "decorator" => &["function.decorator", "function.annotation"],
-
-            // Declarations in the docs, but in practice, also references
-            "function" if has_modifier("defaultLibrary") => &["function.builtin", "function"],
-            "function" => &["function"],
-            "method" if has_modifier("defaultLibrary") => {
-                &["function.builtin", "function.method", "function"]
-            }
-            "method" => &["function.method", "function"],
-            "macro" => &["function.macro", "function"],
-            "label" => &["label"],
-
-            // Tokens
-            "comment" if has_modifier("documentation") => {
-                &["comment.documentation", "comment.doc", "comment"]
-            }
-            "comment" => &["comment"],
-            "string" => &["string"],
-            "keyword" => &["keyword"],
-            "number" => &["number"],
-            "regexp" => &["string.regexp", "string"],
-            "operator" => &["operator"],
-
-            // Not in the VS Code docs, but in the LSP spec.
-            "modifier" => &["keyword.modifier"],
-
-            // Language specific bits.
-
-            // C#. This is part of the spec, but not used elsewhere.
-            "event" => &["type.event", "type"],
-
-            // Rust
-            "lifetime" => &["symbol", "type.parameter", "type"],
-
-            _ => {
-                return None;
-            }
-        };
-
-        // Theme color lookup: try each choice in order until we find one with a color
-        if let Some(theme) = theme {
-            for choice in choices {
-                if let Some(style) = theme.get_opt(choice) {
-                    if style.color.is_some() {
-                        return Some(style);
-                    }
-                }
-            }
-        }
-
-        // No color found in theme: return empty style to preserve tree-sitter syntax + rainbow colors
-        // This ensures the semantic token is still created but won't override existing highlighting
-        Some(HighlightStyle::default())
     }
 }
 

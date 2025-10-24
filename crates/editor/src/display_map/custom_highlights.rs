@@ -11,7 +11,7 @@ use std::{
 };
 use text::BufferId;
 
-use crate::display_map::{HighlightKey, SemanticTokenView, TextHighlights};
+use crate::{display_map::{HighlightKey, TextHighlights}, semantic_tokens::SemanticTokenBufferContainer};
 
 pub struct CustomHighlightsChunks<'a> {
     buffer_chunks: MultiBufferChunks<'a>,
@@ -22,7 +22,7 @@ pub struct CustomHighlightsChunks<'a> {
     highlight_endpoints: Peekable<vec::IntoIter<HighlightEndpoint>>,
     active_highlights: BTreeMap<HighlightKey, HighlightStyle>,
     text_highlights: Option<&'a TextHighlights>,
-    semantic_tokens: Option<&'a HashMap<BufferId, Arc<SemanticTokenView>>>,
+    semantic_tokens: Option<&'a HashMap<BufferId, Arc<SemanticTokenBufferContainer>>>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -37,7 +37,7 @@ impl<'a> CustomHighlightsChunks<'a> {
         range: Range<usize>,
         language_aware: bool,
         text_highlights: Option<&'a TextHighlights>,
-        semantic_tokens: Option<&'a HashMap<BufferId, Arc<SemanticTokenView>>>,
+        semantic_tokens: Option<&'a HashMap<BufferId, Arc<SemanticTokenBufferContainer>>>,
         multibuffer_snapshot: &'a MultiBufferSnapshot,
     ) -> Self {
         Self {
@@ -76,7 +76,7 @@ impl<'a> CustomHighlightsChunks<'a> {
 fn create_highlight_endpoints(
     range: &Range<usize>,
     text_highlights: Option<&TextHighlights>,
-    semantic_tokens: Option<&HashMap<BufferId, Arc<SemanticTokenView>>>,
+    semantic_tokens: Option<&HashMap<BufferId, Arc<SemanticTokenBufferContainer>>>,
     buffer: &MultiBufferSnapshot,
 ) -> iter::Peekable<vec::IntoIter<HighlightEndpoint>> {
     // Pre-allocate with reasonable capacity to minimize reallocations

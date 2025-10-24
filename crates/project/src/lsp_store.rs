@@ -3512,7 +3512,6 @@ pub struct LspStore {
     pub lsp_server_capabilities: HashMap<LanguageServerId, lsp::ServerCapabilities>,
     lsp_data: HashMap<BufferId, BufferLspData>,
     next_hint_id: Arc<AtomicUsize>,
-    lsp_semantic_tokens: HashMap<BufferId, SemanticTokensData>,
     #[allow(dead_code)]
     running_lsp_requests: HashMap<TypeId, (Global, HashMap<LspRequestId, Task<()>>)>,
 }
@@ -3523,6 +3522,7 @@ pub struct BufferLspData {
     document_colors: Option<DocumentColorData>,
     code_lens: Option<CodeLensData>,
     inlay_hints: BufferInlayHints,
+    semantic_tokens: Option<SemanticTokensData>,
     lsp_requests: HashMap<LspKey, HashMap<LspRequestId, Task<()>>>,
     chunk_lsp_requests: HashMap<LspKey, HashMap<BufferChunk, LspRequestId>>,
 }
@@ -3540,6 +3540,7 @@ impl BufferLspData {
             document_colors: None,
             code_lens: None,
             inlay_hints: BufferInlayHints::new(buffer, cx),
+            semantic_tokens: None,
             lsp_requests: HashMap::default(),
             chunk_lsp_requests: HashMap::default(),
         }
@@ -3848,7 +3849,6 @@ impl LspStore {
             lsp_server_capabilities: HashMap::default(),
             lsp_data: HashMap::default(),
             next_hint_id: Arc::default(),
-            lsp_semantic_tokens: HashMap::default(),
             running_lsp_requests: HashMap::default(),
             active_entry: None,
             _maintain_workspace_config,
@@ -3910,7 +3910,6 @@ impl LspStore {
             lsp_server_capabilities: HashMap::default(),
             next_hint_id: Arc::default(),
             lsp_data: HashMap::default(),
-            lsp_semantic_tokens: HashMap::default(),
             running_lsp_requests: HashMap::default(),
             active_entry: None,
 
@@ -4109,7 +4108,6 @@ impl LspStore {
                     };
                     if refcount == 0 {
                         lsp_store.lsp_data.remove(&buffer_id);
-                        lsp_store.lsp_semantic_tokens.remove(&buffer_id);
                         let local = lsp_store.as_local_mut().unwrap();
                         local.registered_buffers.remove(&buffer_id);
                         local.buffers_opened_in_servers.remove(&buffer_id);
@@ -6839,68 +6837,76 @@ impl LspStore {
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Arc<SemanticTokens>>> {
         let buffer_id = buffer.read(cx).remote_id();
+        
+        // Check if we have cached tokens with a result_id and can request delta
+        let result_id = self
+            .latest_lsp_data(&buffer, cx)
+            .semantic_tokens
+            .as_ref()
+            .and_then(|data| data.result_id.clone());
 
-        match self.lsp_semantic_tokens.get(&buffer_id) {
-            Some(SemanticTokensData {
-                result_id: Some(result_id),
-                ..
-            }) if self.is_capable_for_proto_request(
+        if let Some(result_id) = result_id {
+            if self.is_capable_for_proto_request(
                 &buffer,
                 &SemanticTokensDelta {
                     previous_result_id: result_id.clone(),
                 },
                 cx,
-            ) =>
-            {
-                self.send_semantic_tokens_request(
+            ) {
+                return self.send_semantic_tokens_request(
                     buffer,
                     cx,
                     SemanticTokensDelta {
-                        previous_result_id: result_id.clone(),
+                        previous_result_id: result_id,
                     },
                     move |response, store| {
-                        if let Some(existing) = store.lsp_semantic_tokens.get_mut(&buffer_id) {
-                            let semantic_tokens = match response {
-                                SemanticTokensDeltaResponse::Full {
-                                    data,
-                                    id,
-                                    server_id,
-                                } => {
-                                    let mut semantic_tokens = SemanticTokens::from_full(data);
-                                    semantic_tokens.server_id = server_id;
-                                    existing.result_id = id;
-                                    semantic_tokens
-                                }
-                                SemanticTokensDeltaResponse::Delta {
-                                    edits,
-                                    id,
-                                    server_id,
-                                } => {
-                                    let mut semantic_tokens = (*existing.semantic_tokens).clone();
-                                    semantic_tokens.apply(&edits);
-                                    semantic_tokens.server_id = server_id;
-                                    existing.result_id = id;
-                                    semantic_tokens
-                                }
-                            };
-                            existing.semantic_tokens = Arc::new(semantic_tokens);
+                        if let Some(lsp_data) = store.lsp_data.get_mut(&buffer_id) {
+                            if let Some(existing) = &mut lsp_data.semantic_tokens {
+                                let semantic_tokens = match response {
+                                    SemanticTokensDeltaResponse::Full {
+                                        data,
+                                        id,
+                                        server_id,
+                                    } => {
+                                        let mut semantic_tokens = SemanticTokens::from_full(data);
+                                        semantic_tokens.server_id = server_id;
+                                        existing.result_id = id;
+                                        semantic_tokens
+                                    }
+                                    SemanticTokensDeltaResponse::Delta {
+                                        edits,
+                                        id,
+                                        server_id,
+                                    } => {
+                                        let mut semantic_tokens = (*existing.semantic_tokens).clone();
+                                        semantic_tokens.apply(&edits);
+                                        semantic_tokens.server_id = server_id;
+                                        existing.result_id = id;
+                                        semantic_tokens
+                                    }
+                                };
+                                existing.semantic_tokens = Arc::new(semantic_tokens);
+                            }
                         }
                     },
-                )
+                );
             }
-            _ => self.send_semantic_tokens_request(
-                buffer,
-                cx,
-                SemanticTokensFull,
-                move |response, store| {
-                    let data = store.lsp_semantic_tokens.entry(buffer_id).or_default();
+        }
+
+        self.send_semantic_tokens_request(
+            buffer,
+            cx,
+            SemanticTokensFull,
+            move |response, store| {
+                if let Some(lsp_data) = store.lsp_data.get_mut(&buffer_id) {
+                    let data = lsp_data.semantic_tokens.get_or_insert_default();
                     let mut semantic_tokens = SemanticTokens::from_full(response.data);
                     semantic_tokens.server_id = response.server_id;
                     data.semantic_tokens = Arc::new(semantic_tokens);
                     data.result_id = response.id;
-                },
-            ),
-        }
+                }
+            },
+        )
     }
 
     fn send_semantic_tokens_request<R: LspCommand>(
@@ -6938,8 +6944,9 @@ impl LspStore {
                     handle_response(response, store);
 
                     let tokens = store
-                        .lsp_semantic_tokens
+                        .lsp_data
                         .get(&buffer_id)
+                        .and_then(|data| data.semantic_tokens.as_ref())
                         .map(|data| data.semantic_tokens.clone())
                         .ok_or_else(|| {
                             anyhow::anyhow!("No semantic tokens after response handling")
@@ -6977,8 +6984,9 @@ impl LspStore {
                     handle_response(response, store);
 
                     let tokens = store
-                        .lsp_semantic_tokens
+                        .lsp_data
                         .get(&buffer_id)
+                        .and_then(|data| data.semantic_tokens.as_ref())
                         .map(|data| data.semantic_tokens.clone())
                         .ok_or_else(|| {
                             anyhow::anyhow!("No semantic tokens after response handling")

@@ -15,9 +15,9 @@ impl VariableColorCache {
     pub fn new(mode: VariableColorMode) -> Self {
         Self {
             // Pre-allocate capacity to reduce realloc overhead
-            colors: DashMap::with_capacity(256),
+            colors: DashMap::with_capacity(2048),
             mode,
-            max_entries: 3000, // Increased limit for large codebases
+            max_entries: 120_000, // Increased limit for large codebases
         }
     }
 
@@ -25,19 +25,6 @@ impl VariableColorCache {
     pub fn get_or_insert(&self, identifier: &str, theme: &SyntaxTheme) -> HighlightStyle {
         let hash = hash_identifier(identifier);
         self.get_or_insert_by_hash(hash, theme)
-    }
-
-    /// Get or insert color from iterator without allocating String.
-    /// Returns None if the iterator doesn't represent a valid identifier.
-    /// This validates identifier format (starts with letter/_,  contains alphanumeric/_)
-    /// in a single pass while computing the hash.
-    #[inline]
-    pub fn get_or_insert_validated<I>(&self, iter: I, theme: &SyntaxTheme) -> Option<HighlightStyle>
-    where
-        I: Iterator<Item = char>,
-    {
-        let hash = hash_and_validate_identifier(iter)?;
-        Some(self.get_or_insert_by_hash(hash, theme))
     }
 
     #[inline]
@@ -50,7 +37,7 @@ impl VariableColorCache {
         }
 
         if self.colors.len() >= self.max_entries {
-            return self.generate_color_without_cache(hash, theme);
+            log::warn!("Rainbow color cache limit reached");
         }
 
         let style = self.generate_color_without_cache(hash, theme);
@@ -76,7 +63,7 @@ impl VariableColorCache {
         let color = match self.mode {
             VariableColorMode::ThemePalette => {
                 let palette_size = theme.rainbow_palette_size();
-                let index = fibonacci_hash(hash, palette_size);
+                let index = calculate_color_index(hash, palette_size);
                 theme
                     .rainbow_color(index)
                     .and_then(|style| style.color)
@@ -111,70 +98,8 @@ pub fn hash_identifier(s: &str) -> u64 {
     })
 }
 
-/// Hash identifier from iterator WITH validation in a single pass.
-/// Returns None if not a valid identifier (must start with letter/underscore,
-/// contain only alphanumeric/underscore, non-empty, and ≤120 bytes).
 #[inline]
-pub fn hash_and_validate_identifier<I>(mut iter: I) -> Option<u64>
-where
-    I: Iterator<Item = char>,
-{
-    let mut hash = FNV_OFFSET;
-    let mut len = 0;
-    const MAX_LEN: usize = 120;
-
-    // Check first character
-    let first = iter.next()?;
-    if !first.is_alphabetic() && first != '_' {
-        return None;
-    }
-
-    // Hash first character
-    for byte in first.encode_utf8(&mut [0; 4]).bytes() {
-        hash = (hash ^ (byte as u64)).wrapping_mul(FNV_PRIME);
-    }
-    len += first.len_utf8();
-
-    // Process remaining characters
-    for ch in iter {
-        if !ch.is_alphanumeric() && ch != '_' {
-            return None;
-        }
-
-        len += ch.len_utf8();
-        if len > MAX_LEN {
-            return None;
-        }
-
-        for byte in ch.encode_utf8(&mut [0; 4]).bytes() {
-            hash = (hash ^ (byte as u64)).wrapping_mul(FNV_PRIME);
-        }
-    }
-
-    Some(hash)
-}
-pub fn validate_identifier_for_rainbow(text: &str) -> Option<&str> {
-    let trimmed = text.trim();
-
-    if trimmed.is_empty() || trimmed.len() > 120 {
-        return None;
-    }
-    let mut chars = trimmed.chars();
-    let first = chars.next()?;
-
-    if !first.is_alphabetic() && first != '_' {
-        return None;
-    }
-
-    if !chars.all(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-
-    Some(trimmed)
-}
-
-#[inline]
-fn fibonacci_hash(hash: u64, palette_size: usize) -> usize {
+fn calculate_color_index(hash: u64, palette_size: usize) -> usize {
     let distributed = hash.wrapping_mul(GOLDEN_RATIO_MULTIPLIER);
     (distributed as usize) % palette_size
 }
@@ -183,7 +108,7 @@ fn fibonacci_hash(hash: u64, palette_size: usize) -> usize {
 #[cfg(test)]
 pub fn hash_to_color_index(identifier: &str, palette_size: usize) -> usize {
     let hash = hash_identifier(identifier);
-    fibonacci_hash(hash, palette_size)
+    calculate_color_index(hash, palette_size)
 }
 
 #[inline]
@@ -267,7 +192,7 @@ mod tests {
         for i in 0..1200 {
             let name = format!("identifier_{}", i);
             let hash = hash_identifier(&name);
-            let bucket = fibonacci_hash(hash, 12);
+            let bucket = calculate_color_index(hash, 12);
             bucket_counts[bucket] += 1;
         }
 

@@ -499,6 +499,7 @@ impl Editor {
                     .update_in(cx, |editor, window, cx| {
                         editor.register_visible_buffers(cx);
                         editor.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
+                        editor.refresh_semantic_tokens(None, cx);
                         editor.update_lsp_data(None, window, cx);
                     })
                     .ok();
@@ -622,6 +623,7 @@ impl Editor {
                     editor.register_visible_buffers(cx);
                     editor.refresh_colors_for_visible_range(None, window, cx);
                     editor.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
+                    editor.refresh_semantic_tokens(None, cx);
                 })
                 .ok();
         });
