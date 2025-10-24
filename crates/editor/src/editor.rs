@@ -146,6 +146,7 @@ use project::{
     BreakpointWithPosition, CodeAction, Completion, CompletionDisplayOptions, CompletionIntent,
     CompletionResponse, CompletionSource, DisableAiSettings, DocumentHighlight, InlayHint, InlayId,
     InvalidationStrategy, Location, LocationLink, PrepareRenameResponse, Project, ProjectItem,
+    lsp_store::semantic_token_cache::InvalidationStrategy as SemanticTokensInvalidationStrategy,
     ProjectPath, ProjectTransaction, TaskSourceKind,
     debugger::{
         breakpoint_store::{
@@ -1860,7 +1861,7 @@ impl Editor {
                     project::Event::RefreshSemanticTokens(server_id) => {
                         editor.refresh_semantic_tokens(
                             None,
-                            project::lsp_store::semantic_token_cache::InvalidationStrategy::RefreshRequested(*server_id),
+                            SemanticTokensInvalidationStrategy::RefreshRequested(*server_id),
                             cx,
                         );
                     }
@@ -1877,7 +1878,7 @@ impl Editor {
                         editor.register_visible_buffers(cx);
                         editor.refresh_semantic_tokens(
                             None,
-                            project::lsp_store::semantic_token_cache::InvalidationStrategy::BufferEdited,
+                            SemanticTokensInvalidationStrategy::BufferEdited,
                             cx,
                         );
                     }
@@ -1912,18 +1913,19 @@ impl Editor {
                             editor.refresh_document_highlights(cx);
                             editor.refresh_semantic_tokens(
                                 Some(buffer_id),
-                                project::lsp_store::semantic_token_cache::InvalidationStrategy::None,
+                                SemanticTokensInvalidationStrategy::None,
                                 cx,
                             );
                         }
                     }
 
                     project::Event::LanguageServerIndexingComplete {
-                        language_server_id: _,
+                        language_server_id,
                     } => {
+                        // Force full refresh after indexing to get new cross-file analysis
                         editor.refresh_semantic_tokens(
                             None,
-                            project::lsp_store::semantic_token_cache::InvalidationStrategy::BufferEdited,
+                            SemanticTokensInvalidationStrategy::RefreshRequested(*language_server_id),
                             cx,
                         );
                     }
@@ -20914,7 +20916,7 @@ impl Editor {
                         );
                         self.refresh_semantic_tokens(
                             Some(buffer_id),
-                            project::lsp_store::semantic_token_cache::InvalidationStrategy::BufferEdited,
+                            SemanticTokensInvalidationStrategy::BufferEdited,
                             cx,
                         );
                     }
@@ -20958,7 +20960,7 @@ impl Editor {
                 self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
                 self.refresh_semantic_tokens(
                     Some(buffer_id),
-                    project::lsp_store::semantic_token_cache::InvalidationStrategy::None,
+                    SemanticTokensInvalidationStrategy::None,
                     cx,
                 );
 
@@ -21004,7 +21006,7 @@ impl Editor {
                 self.refresh_document_highlights(cx);
                 self.refresh_semantic_tokens(
                     None,
-                    project::lsp_store::semantic_token_cache::InvalidationStrategy::None,
+                    SemanticTokensInvalidationStrategy::None,
                     cx,
                 );
                 cx.emit(EditorEvent::ExcerptsExpanded { ids: ids.clone() })
@@ -21022,7 +21024,7 @@ impl Editor {
                 self.update_lsp_data(Some(*buffer_id), window, cx);
                 self.refresh_semantic_tokens(
                     Some(*buffer_id),
-                    project::lsp_store::semantic_token_cache::InvalidationStrategy::BufferEdited,
+                    SemanticTokensInvalidationStrategy::BufferEdited,
                     cx,
                 );
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
@@ -21131,7 +21133,7 @@ impl Editor {
             self.last_semantic_tokens_max_lines = semantic_tokens_max_lines;
             self.refresh_semantic_tokens(
                 None,
-                project::lsp_store::semantic_token_cache::InvalidationStrategy::BufferEdited,
+                SemanticTokensInvalidationStrategy::BufferEdited,
                 cx,
             );
         }
@@ -22078,7 +22080,7 @@ impl Editor {
     fn refresh_semantic_tokens(
         &mut self,
         for_buffer: Option<BufferId>,
-        invalidation: project::lsp_store::semantic_token_cache::InvalidationStrategy,
+        invalidation: SemanticTokensInvalidationStrategy,
         cx: &mut Context<Self>,
     ) {
         let Some(project) = self.project.as_ref() else {
@@ -23475,7 +23477,7 @@ impl SemanticsProvider for Entity<Project> {
             // Default to no invalidation when called from DisplayMap
             project.semantic_tokens(
                 buffer_handle,
-                project::lsp_store::semantic_token_cache::InvalidationStrategy::None,
+                SemanticTokensInvalidationStrategy::None,
                 cx,
             )
         }))

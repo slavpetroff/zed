@@ -5,7 +5,7 @@ pub(crate) mod scroll_amount;
 use crate::editor_settings::ScrollBeyondLastLine;
 use crate::{
     Anchor, DisplayPoint, DisplayRow, Editor, EditorEvent, EditorMode, EditorSettings,
-    InlayHintRefreshReason, MultiBufferSnapshot, RowExt, ToPoint,
+    InlayHintRefreshReason, MultiBufferSnapshot, RowExt, SemanticTokensInvalidationStrategy, ToPoint,
     display_map::{DisplaySnapshot, ToDisplayPoint},
     hover_popover::hide_hover,
     persistence::DB,
@@ -501,7 +501,7 @@ impl Editor {
                         editor.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
                         editor.refresh_semantic_tokens(
                             None,
-                            project::lsp_store::semantic_token_cache::InvalidationStrategy::None,
+                            SemanticTokensInvalidationStrategy::None,
                             cx,
                         );
                         editor.update_lsp_data(None, window, cx);
@@ -629,7 +629,7 @@ impl Editor {
                     editor.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
                     editor.refresh_semantic_tokens(
                         None,
-                        project::lsp_store::semantic_token_cache::InvalidationStrategy::None,
+                        SemanticTokensInvalidationStrategy::None,
                         cx,
                     );
                 })

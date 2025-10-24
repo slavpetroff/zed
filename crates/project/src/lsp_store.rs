@@ -6864,14 +6864,16 @@ impl LspStore {
     pub fn semantic_tokens(
         &mut self,
         buffer: Entity<Buffer>,
-        invalidate: SemanticTokensInvalidationStrategy,
+        invalidatetion_strategy: SemanticTokensInvalidationStrategy,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Arc<SemanticTokens>>> {
         let buffer_id = buffer.read(cx).remote_id();
-        
+
         // Check if we should use cached tokens or request delta
-        let should_invalidate = invalidate.should_invalidate();
-        let _for_server = if let SemanticTokensInvalidationStrategy::RefreshRequested(server_id) = invalidate {
+        let should_invalidate = invalidatetion_strategy.should_invalidate();
+        let _for_server = if let SemanticTokensInvalidationStrategy::RefreshRequested(server_id) =
+            invalidatetion_strategy
+        {
             Some(server_id)
         } else {
             None
@@ -6919,7 +6921,8 @@ impl LspStore {
                                         id,
                                         server_id,
                                     } => {
-                                        let mut semantic_tokens = (*existing.semantic_tokens).clone();
+                                        let mut semantic_tokens =
+                                            (*existing.semantic_tokens).clone();
                                         semantic_tokens.apply(&edits);
                                         semantic_tokens.server_id = server_id;
                                         existing.result_id = id;
@@ -6934,20 +6937,15 @@ impl LspStore {
             }
         }
 
-        self.send_semantic_tokens_request(
-            buffer,
-            cx,
-            SemanticTokensFull,
-            move |response, store| {
-                if let Some(lsp_data) = store.lsp_data.get_mut(&buffer_id) {
-                    let data = lsp_data.semantic_tokens.get_or_insert_default();
-                    let mut semantic_tokens = SemanticTokens::from_full(response.data);
-                    semantic_tokens.server_id = response.server_id;
-                    data.semantic_tokens = Arc::new(semantic_tokens);
-                    data.result_id = response.id;
-                }
-            },
-        )
+        self.send_semantic_tokens_request(buffer, cx, SemanticTokensFull, move |response, store| {
+            if let Some(lsp_data) = store.lsp_data.get_mut(&buffer_id) {
+                let data = lsp_data.semantic_tokens.get_or_insert_default();
+                let mut semantic_tokens = SemanticTokens::from_full(response.data);
+                semantic_tokens.server_id = response.server_id;
+                data.semantic_tokens = Arc::new(semantic_tokens);
+                data.result_id = response.id;
+            }
+        })
     }
 
     fn send_semantic_tokens_request<R: LspCommand>(
