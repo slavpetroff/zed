@@ -1153,9 +1153,8 @@ pub struct Editor {
     addons: HashMap<TypeId, Box<dyn Addon>>,
     registered_buffers: HashMap<BufferId, OpenLspBufferHandle>,
     pending_semantic_token_requests: HashSet<BufferId>,
-    pending_semantic_token_buffers: Arc<Mutex<HashSet<BufferId>>>,
-    semantic_tokens_refresh_active: Arc<Mutex<bool>>,
-    semantic_tokens_refresh_task: Task<()>,
+    semantic_tokens_fetched_excerpts: HashMap<BufferId, HashSet<ExcerptId>>,
+    semantic_tokens_refresh_tasks: HashMap<BufferId, Task<()>>,
     last_rainbow_config: RainbowConfig,
     last_semantic_tokens_max_lines: u32,
     load_diff_task: Option<Shared<Task<()>>>,
@@ -2266,9 +2265,8 @@ impl Editor {
             addons: HashMap::default(),
             registered_buffers: HashMap::default(),
             pending_semantic_token_requests: HashSet::default(),
-            pending_semantic_token_buffers: Arc::new(Mutex::new(HashSet::default())),
-            semantic_tokens_refresh_active: Arc::new(Mutex::new(false)),
-            semantic_tokens_refresh_task: Task::ready(()),
+            semantic_tokens_fetched_excerpts: HashMap::default(),
+            semantic_tokens_refresh_tasks: HashMap::default(),
             last_rainbow_config: EditorSettings::get_global(cx).rainbow_highlighting.clone(),
             last_semantic_tokens_max_lines: EditorSettings::get_global(cx)
                 .semantic_tokens_max_file_lines,
@@ -20983,11 +20981,35 @@ impl Editor {
                 self.register_buffer(buffer_id, cx);
                 self.update_lsp_data(Some(buffer_id), window, cx);
                 self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
-                self.refresh_semantic_tokens(
-                    Some(buffer_id),
-                    SemanticTokensInvalidationStrategy::None,
-                    cx,
-                );
+                
+                // For multi-buffer, process all visible excerpts since they might span multiple buffers
+                // For single-buffer, just process this specific buffer
+                if self.buffer.read(cx).is_singleton() {
+                    self.refresh_semantic_tokens(
+                        Some(buffer_id),
+                        SemanticTokensInvalidationStrategy::None,
+                        cx,
+                    );
+                } else {
+                    self.refresh_semantic_tokens(
+                        None,
+                        SemanticTokensInvalidationStrategy::None,
+                        cx,
+                    );
+                    
+                    // Defer another refresh for multi-buffer to handle cases where
+                    // the editor hasn't been laid out yet when excerpts are first added
+                    cx.spawn(async move |editor, cx| {
+                        cx.background_executor().timer(Duration::from_millis(100)).await;
+                        editor.update(cx, |editor, cx| {
+                            editor.refresh_semantic_tokens(
+                                None,
+                                SemanticTokensInvalidationStrategy::None,
+                                cx,
+                            );
+                        }).log_err();
+                    }).detach();
+                }
 
                 cx.emit(EditorEvent::ExcerptsAdded {
                     buffer: buffer.clone(),
@@ -22112,151 +22134,146 @@ impl Editor {
             return;
         };
 
-        let buffer_ids: Vec<BufferId> = if let Some(buffer_id) = for_buffer {
-            vec![buffer_id]
-        } else {
-            self.visible_excerpts(cx)
-                .into_values()
-                .map(|(buffer, _, _)| buffer.read(cx).remote_id())
-                .collect()
-        };
+        if invalidation.should_invalidate() {
+            if let Some(buffer_id) = for_buffer {
+                self.semantic_tokens_fetched_excerpts.remove(&buffer_id);
+            } else {
+                self.semantic_tokens_fetched_excerpts.clear();
+            }
+        }
 
-        let mut pending = self.pending_semantic_token_buffers.lock();
-        pending.extend(buffer_ids);
-        drop(pending);
+        let is_single_buffer = self.buffer.read(cx).is_singleton();
+        let lsp_store = project.read(cx).lsp_store();
+        let visible_excerpts = self.visible_excerpts(cx);
+        
+        if !is_single_buffer {
+            log::debug!(
+                "refresh_semantic_tokens: multi-buffer with {} visible excerpts",
+                visible_excerpts.len()
+            );
+        }
 
-        let mut active = self.semantic_tokens_refresh_active.lock();
-        if *active {
+        if visible_excerpts.is_empty() {
             return;
         }
-        *active = true;
-        drop(active);
 
-        let pending_buffers = self.pending_semantic_token_buffers.clone();
-        let refresh_active = self.semantic_tokens_refresh_active.clone();
-        let multibuffer = self.buffer.clone();
-        let project = project.clone();
+        let mut buffers_to_request: HashMap<BufferId, (Entity<Buffer>, Vec<Range<text::Anchor>>)> = HashMap::default();
+        
+        let visible_excerpt_ids: Vec<_> = if let Some(buffer_id) = for_buffer {
+            visible_excerpts
+                .iter()
+                .filter_map(|(excerpt_id, (buffer, _, _))| {
+                    (buffer.read(cx).remote_id() == buffer_id).then_some(*excerpt_id)
+                })
+                .collect()
+        } else {
+            visible_excerpts.keys().copied().collect()
+        };
+        
+        log::debug!(
+            "refresh_semantic_tokens: processing {} excerpt IDs (for_buffer={:?})",
+            visible_excerpt_ids.len(), for_buffer
+        );
+        
+        for excerpt_id in visible_excerpt_ids {
+            let Some((buffer, _, excerpt_range)) = visible_excerpts.get(&excerpt_id) else {
+                continue;
+            };
+            
+            let buffer_id = buffer.read(cx).remote_id();
+            let max_lines = EditorSettings::get_global(cx).semantic_tokens_max_file_lines;
+            
+            if buffer.read(cx).max_point().row + 1 > max_lines {
+                log::debug!("refresh_semantic_tokens: skipping buffer {:?} (exceeds max lines)", buffer_id);
+                continue;
+            }
 
-        self.semantic_tokens_refresh_task = cx.spawn(async move |editor, cx| {
-            const DEBOUNCE_SMALL: u64 = 50;
-            const DEBOUNCE_MEDIUM: u64 = 100;
-            const DEBOUNCE_LARGE: u64 = 200;
-            const MEDIUM_BATCH_THRESHOLD: usize = 3;
-            const LARGE_BATCH_THRESHOLD: usize = 10;
+            if self.pending_semantic_token_requests.contains(&buffer_id) {
+                log::debug!("refresh_semantic_tokens: skipping buffer {:?} (pending request)", buffer_id);
+                continue;
+            }
 
-            loop {
-                let pending_count = pending_buffers.lock().len();
-                let debounce_ms = if pending_count > LARGE_BATCH_THRESHOLD {
-                    DEBOUNCE_LARGE
-                } else if pending_count > MEDIUM_BATCH_THRESHOLD {
-                    DEBOUNCE_MEDIUM
-                } else {
-                    DEBOUNCE_SMALL
-                };
-                cx.background_executor()
-                    .timer(Duration::from_millis(debounce_ms))
-                    .await;
-
-                const MAX_BUFFERS_PER_SESSION: usize = 50;
-                const LARGE_BATCH_SIZE: usize = 20;
-                const CHUNK_SIZE_NORMAL: usize = 5;
-                const CHUNK_SIZE_LARGE: usize = 3;
-
-                let buffers_to_process: Vec<BufferId> = {
-                    let mut pending = pending_buffers.lock();
-                    let mut buffers: Vec<_> = pending.drain().collect();
-
-                    if buffers.len() > MAX_BUFFERS_PER_SESSION {
-                        log::warn!(
-                            "Semantic tokens requested for {} buffers, capping at {}",
-                            buffers.len(),
-                            MAX_BUFFERS_PER_SESSION
-                        );
-                        buffers.truncate(MAX_BUFFERS_PER_SESSION);
-                    }
-                    buffers
-                };
-
-                if buffers_to_process.is_empty() {
-                    *refresh_active.lock() = false;
-                    return;
+            let fetched_excerpts = self.semantic_tokens_fetched_excerpts.entry(buffer_id).or_default();
+            
+            if is_single_buffer {
+                let has_full = lsp_store.read(cx).has_full_semantic_tokens(buffer, cx);
+                if !has_full || invalidation.should_invalidate() {
+                    buffers_to_request.entry(buffer_id).or_insert_with(|| (buffer.clone(), Vec::new()));
                 }
-
-                let chunk_size = if buffers_to_process.len() > LARGE_BATCH_SIZE {
-                    CHUNK_SIZE_LARGE
-                } else {
-                    CHUNK_SIZE_NORMAL
-                };
-
-                for chunk in buffers_to_process.chunks(chunk_size) {
-                    let chunk_tasks: Vec<_> = editor
-                        .update(cx, |editor, cx| {
-                            let mut tasks = Vec::new();
-                            for &buffer_id in chunk {
-                                let Some(buffer) = multibuffer.read(cx).buffer(buffer_id) else {
-                                    continue;
-                                };
-
-                                if editor.pending_semantic_token_requests.contains(&buffer_id) {
-                                    continue;
-                                }
-
-                                let max_lines = EditorSettings::get_global(cx).semantic_tokens_max_file_lines;
-                                let line_count = buffer.read(cx).max_point().row + 1;
-                                if line_count > max_lines {
-                                    continue;
-                                }
-                                editor.pending_semantic_token_requests.insert(buffer_id);
-
-                                // Extract visible ranges for this buffer
-                                let visible_ranges = editor.extract_visible_ranges_for_buffer(buffer_id, cx);
-                                
-                                let project = project.clone();
-                                let task = cx.spawn(async move |editor, cx| {
-                                    let Some(lsp_task) = project
-                                        .update(cx, |project, cx| {
-                                            project
-                                                .lsp_store()
-                                                .update(cx, |store, cx| store.semantic_tokens(buffer, visible_ranges, invalidation, cx))
-                                        })
-                                        .log_err()
-                                    else {
-                                        editor
-                                            .update(cx, |editor, _cx| {
-                                                editor.pending_semantic_token_requests.remove(&buffer_id);
-                                            })
-                                            .log_err();
-                                        return;
-                                    };
-
-                                    match lsp_task.await {
-                                        Ok(tokens) if tokens.server_id.is_some() => {}
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            log::warn!("Failed to fetch semantic tokens for buffer {buffer_id}: {e:#}");
-                                        }
-                                    }
-
-                                    editor
-                                        .update(cx, |editor, _cx| {
-                                            editor.pending_semantic_token_requests.remove(&buffer_id);
-                                        })
-                                        .log_err();
-                                });
-
-                                tasks.push(task);
-                            }
-                            tasks
-                        })
-                        .log_err()
-                        .unwrap_or_default();
-
-                    for task in chunk_tasks {
-                        task.await;
-                    }
+            } else {
+                let is_new = fetched_excerpts.insert(excerpt_id);
+                log::debug!(
+                    "refresh_semantic_tokens: excerpt {:?} for buffer {:?} - is_new={}, should_invalidate={}",
+                    excerpt_id, buffer_id, is_new, invalidation.should_invalidate()
+                );
+                if is_new || invalidation.should_invalidate() {
+                    let snapshot = buffer.read(cx).snapshot();
+                    let range = snapshot.anchor_before(excerpt_range.start)..snapshot.anchor_after(excerpt_range.end);
+                    buffers_to_request
+                        .entry(buffer_id)
+                        .or_insert_with(|| (buffer.clone(), Vec::new()))
+                        .1
+                        .push(range);
                 }
             }
-        });
+        }
+
+        if buffers_to_request.is_empty() {
+            log::debug!("refresh_semantic_tokens: no buffers to request");
+            return;
+        }
+        
+        log::debug!("refresh_semantic_tokens: requesting tokens for {} buffers", buffers_to_request.len());
+
+        for (buffer_id, (buffer, ranges)) in buffers_to_request {
+            if self.pending_semantic_token_requests.contains(&buffer_id) {
+                continue;
+            }
+            
+            let request_ranges = if is_single_buffer {
+                None
+            } else if ranges.is_empty() {
+                continue; // Skip if multi-buffer but no visible ranges
+            } else {
+                Some(ranges)
+            };
+            
+            self.pending_semantic_token_requests.insert(buffer_id);
+            let project = project.clone();
+            
+            log::debug!(
+                "refresh_semantic_tokens: spawning LSP request for buffer {:?} with {} ranges",
+                buffer_id, request_ranges.as_ref().map(|r| r.len()).unwrap_or(0)
+            );
+            
+            let task = cx.spawn(async move |editor, cx| {
+                log::debug!("refresh_semantic_tokens: LSP task started for buffer {:?}", buffer_id);
+                
+                let lsp_task = project
+                    .update(cx, |project, cx| {
+                        project.lsp_store().update(cx, |store, cx| {
+                            store.semantic_tokens(buffer, request_ranges, invalidation, cx)
+                        })
+                    })
+                    .log_err();
+                
+                if let Some(lsp_task) = lsp_task {
+                    log::debug!("refresh_semantic_tokens: awaiting LSP response for buffer {:?}", buffer_id);
+                    lsp_task.await.log_err();
+                    log::debug!("refresh_semantic_tokens: LSP response received for buffer {:?}", buffer_id);
+                } else {
+                    log::warn!("refresh_semantic_tokens: no LSP task returned for buffer {:?}", buffer_id);
+                }
+                
+                editor
+                    .update(cx, |editor, _| {
+                        editor.pending_semantic_token_requests.remove(&buffer_id);
+                    })
+                    .log_err();
+            });
+            
+            self.semantic_tokens_refresh_tasks.insert(buffer_id, task);
+        }
     }
 
     fn ignore_lsp_data(&self) -> bool {
