@@ -3615,34 +3615,10 @@ struct CodeLensData {
     update: Option<(Global, CodeLensTask)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TokenSource {
-    None,
-    Ranges,
-    Full,
-}
-
-impl Default for TokenSource {
-    fn default() -> Self {
-        TokenSource::None
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct SemanticTokensData {
     result_id: Option<String>,
     semantic_tokens: Arc<SemanticTokens>,
-    source: TokenSource,
-}
-
-impl Default for SemanticTokensData {
-    fn default() -> Self {
-        Self {
-            result_id: None,
-            semantic_tokens: Default::default(),
-            source: TokenSource::None,
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -4000,12 +3976,6 @@ impl LspStore {
                     if local.registered_buffers.contains_key(&buffer_id) {
                         local.register_buffer_with_language_servers(buffer, HashSet::default(), cx);
                     }
-                }
-            }
-            BufferStoreEvent::BufferDropped(buffer_id) => {
-                // Clean up semantic token cache to prevent memory leaks
-                if let Some(lsp_data) = self.lsp_data.get_mut(buffer_id) {
-                    lsp_data.semantic_tokens = None;
                 }
             }
             _ => {}
@@ -6901,7 +6871,6 @@ impl LspStore {
         use crate::lsp_command::SemanticTokensRange;
 
         let buffer_id = buffer.read(cx).remote_id();
-        
         let for_server = if let SemanticTokensInvalidationStrategy::RefreshRequested(server_id) =
             invalidation_strategy
         {
@@ -6910,183 +6879,118 @@ impl LspStore {
             None
         };
 
-        // Find a language server for this buffer to check capabilities
-        // If we have an explicit server_id from invalidation, use that
-        // Otherwise, pick the first server that supports semantic tokens ranges
-        let (server_id, supports_range) = if let Some(id) = for_server {
-            // Check if the explicit server supports ranges
-            let supports = self.lsp_server_capabilities
-                .get(&id)
-                .and_then(|caps| caps.semantic_tokens_provider.as_ref())
-                .is_some_and(|provider| {
-                    let options = match provider {
-                        lsp::SemanticTokensServerCapabilities::SemanticTokensOptions(opts) => opts,
-                        lsp::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(opts) => &opts.semantic_tokens_options,
-                    };
-                    options.range.is_some()
-                });
-            (Some(id), supports)
-        } else {
-            // Look through all servers with capabilities and find one that supports ranges
-            let found = self.lsp_server_capabilities
-                .iter()
-                .find_map(|(server_id, caps)| {
-                    let supports_range = caps.semantic_tokens_provider
-                        .as_ref()
-                        .is_some_and(|provider| {
-                            let options = match provider {
-                                lsp::SemanticTokensServerCapabilities::SemanticTokensOptions(opts) => opts,
-                                lsp::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(opts) => &opts.semantic_tokens_options,
-                            };
-                            options.range.is_some()
-                        });
-                    
-                    if supports_range {
-                        Some(*server_id)
-                    } else {
-                        None
-                    }
-                });
-            
-            (found, found.is_some())
-        };
+        // Check if server supports range requests
+        let supports_range = for_server
+            .and_then(|server_id| self.lsp_server_capabilities.get(&server_id))
+            .map(|caps| {
+                caps.semantic_tokens_provider
+                    .as_ref()
+                    .is_some_and(|provider| {
+                        let options = match provider {
+                            lsp::SemanticTokensServerCapabilities::SemanticTokensOptions(opts) => opts,
+                            lsp::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(opts) => &opts.semantic_tokens_options,
+                        };
+                        options.range.is_some()
+                    })
+            })
+            .unwrap_or(false);
 
-        // If server doesn't support range requests, return cached or empty tokens
-        // DO NOT fall back to full document in multi-buffer contexts (find-all would request full for all buffers)
+        // If server doesn't support range requests, fall back to full document
         if !supports_range {
-            log::debug!(
-                "Server {:?} doesn't support semantic token range requests, returning cached tokens if available",
-                server_id
-            );
-            
-            // Return cached tokens if we have them, otherwise empty
-            let cached_tokens = self.lsp_data
-                .get(&buffer_id)
-                .and_then(|data| data.semantic_tokens.as_ref())
-                .map(|data| data.semantic_tokens.clone())
-                .unwrap_or_default();
-            
-            return Task::ready(Ok(cached_tokens));
+            log::debug!("Server doesn't support semantic token range requests, falling back to full document");
+            return self.semantic_tokens(buffer, None, invalidation_strategy, cx);
         }
 
-        log::debug!(
-            "Server {:?} supports range requests, requesting {} ranges for buffer {:?}",
-            server_id, ranges.len(), buffer_id
-        );
-
-        // Request tokens for each range, storing each response individually
+        // Request tokens for each range
         let mut tasks = Vec::new();
         
-        for (range_idx, range) in ranges.into_iter().enumerate() {
+        for range in ranges {
             let task = self.send_semantic_tokens_request(
                 buffer.clone(),
-                server_id,
+                for_server,
                 cx,
                 SemanticTokensRange { range: range.clone() },
-                move |response, store| {
-                    // Store each range response, merging with existing tokens
-                    if let Some(lsp_data) = store.lsp_data.get_mut(&buffer_id) {
-                        let data = lsp_data.semantic_tokens.get_or_insert_default();
-                        
-                        // Create tokens from response
-                        let mut new_tokens = SemanticTokens::from_full(response.data);
-                        new_tokens.server_id = response.server_id;
-                        
-                        // If this is the first range or we don't have range tokens yet, just store it
-                        if range_idx == 0 || data.source != TokenSource::Ranges {
-                            data.semantic_tokens = Arc::new(new_tokens);
-                            data.result_id = None;
-                            data.source = TokenSource::Ranges;
-                        } else {
-                            // Merge with existing range tokens
-                            let existing = &data.semantic_tokens;
-                            let mut all_tokens = Vec::new();
-                            
-                            // Collect existing tokens
-                            for token in existing.tokens() {
-                                all_tokens.push(token);
-                            }
-                            
-                            // Collect new tokens
-                            for token in new_tokens.tokens() {
-                                all_tokens.push(token);
-                            }
-                            
-                            // Sort and deduplicate
-                            all_tokens.sort_by_key(|token| (token.line, token.start));
-                            all_tokens.dedup_by_key(|token| (token.line, token.start, token.length));
-                            
-                            // Re-encode to delta format
-                            let mut merged_data = Vec::with_capacity(all_tokens.len() * 5);
-                            let mut prev_line = 0;
-                            let mut prev_start = 0;
-                            
-                            for token in all_tokens {
-                                let delta_line = token.line - prev_line;
-                                let delta_start = if delta_line == 0 {
-                                    token.start - prev_start
-                                } else {
-                                    token.start
-                                };
-                                
-                                merged_data.push(delta_line);
-                                merged_data.push(delta_start);
-                                merged_data.push(token.length);
-                                merged_data.push(token.token_type);
-                                merged_data.push(token.token_modifiers);
-                                
-                                prev_line = token.line;
-                                prev_start = token.start;
-                            }
-                            
-                            let mut merged_tokens = SemanticTokens::from_full(merged_data);
-                            merged_tokens.server_id = response.server_id;
-                            data.semantic_tokens = Arc::new(merged_tokens);
-                        }
-                    }
+                move |_response, _store| {
+                    // Don't store individual range responses, we'll merge them
                 },
             );
             tasks.push(task);
         }
 
-        // Wait for all range requests to complete
+        // Wait for all range requests to complete and merge the results
         cx.spawn(async move |store, cx| {
             use futures::future::join_all;
             
             let results = join_all(tasks).await;
             
-            // Check for errors
-            for (idx, result) in results.iter().enumerate() {
-                if let Err(e) = result {
-                    log::warn!("Failed to fetch semantic tokens for range {}: {:#}", idx, e);
+            // Collect all tokens from all ranges
+            let mut all_tokens = Vec::new();
+            let mut final_server_id = None;
+            
+            for result in results {
+                match result {
+                    Ok(tokens) => {
+                        if final_server_id.is_none() {
+                            final_server_id = tokens.server_id;
+                        }
+                        
+                        // Convert delta-encoded tokens to absolute positions
+                        for token in tokens.tokens() {
+                            all_tokens.push(token);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to fetch semantic tokens for range: {:#}", e);
+                    }
                 }
             }
             
-            // Return the merged tokens from store
+            // Sort tokens by position and remove duplicates
+            all_tokens.sort_by_key(|token| (token.line, token.start));
+            all_tokens.dedup_by_key(|token| (token.line, token.start, token.length));
+            
+            // Re-encode tokens back to delta format
+            let mut merged_data = Vec::with_capacity(all_tokens.len() * 5);
+            let mut prev_line = 0;
+            let mut prev_start = 0;
+            
+            for token in all_tokens {
+                let delta_line = token.line - prev_line;
+                let delta_start = if delta_line == 0 {
+                    token.start - prev_start
+                } else {
+                    token.start
+                };
+                
+                merged_data.push(delta_line);
+                merged_data.push(delta_start);
+                merged_data.push(token.length);
+                merged_data.push(token.token_type);
+                merged_data.push(token.token_modifiers);
+                
+                prev_line = token.line;
+                prev_start = token.start;
+            }
+            
+            // Create merged semantic tokens
+            let mut merged_tokens = SemanticTokens::from_full(merged_data);
+            merged_tokens.server_id = final_server_id;
+            
+            // Store the merged result
+            let merged_result = Arc::new(merged_tokens);
+            let result_for_return = merged_result.clone();
+            
             store.update(cx, |store, _cx| {
-                store.lsp_data
-                    .get(&buffer_id)
-                    .and_then(|data| data.semantic_tokens.as_ref())
-                    .map(|data| data.semantic_tokens.clone())
-                    .ok_or_else(|| anyhow::anyhow!("No semantic tokens after merging ranges"))
-            })?
+                if let Some(lsp_data) = store.lsp_data.get_mut(&buffer_id) {
+                    let data = lsp_data.semantic_tokens.get_or_insert_default();
+                    data.semantic_tokens = merged_result;
+                    // Note: result_id is not meaningful for merged ranges
+                    data.result_id = None;
+                }
+            })?;
+            
+            Ok(result_for_return)
         })
-    }
-
-    pub fn has_full_semantic_tokens(&self, buffer: &Entity<Buffer>, cx: &App) -> bool {
-        let buffer_id = buffer.read(cx).remote_id();
-        self.lsp_data
-            .get(&buffer_id)
-            .and_then(|d| d.semantic_tokens.as_ref())
-            .map_or(false, |data| data.source == TokenSource::Full)
-    }
-
-    pub fn has_any_semantic_tokens(&self, buffer: &Entity<Buffer>, cx: &App) -> bool {
-        let buffer_id = buffer.read(cx).remote_id();
-        self.lsp_data
-            .get(&buffer_id)
-            .and_then(|d| d.semantic_tokens.as_ref())
-            .map_or(false, |data| data.source != TokenSource::None)
     }
 
     pub fn semantic_tokens(
@@ -7097,18 +7001,6 @@ impl LspStore {
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Arc<SemanticTokens>>> {
         let buffer_id = buffer.read(cx).remote_id();
-        let should_invalidate = invalidation_strategy.should_invalidate();
-        
-        // Smart caching: If we have full document and not invalidating, return cached
-        if !should_invalidate && ranges.is_none() {
-            if let Some(data) = self.lsp_data.get(&buffer_id)
-                .and_then(|d| d.semantic_tokens.as_ref())
-            {
-                if data.source == TokenSource::Full {
-                    return Task::ready(Ok(data.semantic_tokens.clone()));
-                }
-            }
-        }
 
         // If ranges are provided, try to use range requests (if supported)
         if let Some(ranges) = ranges {
@@ -7119,6 +7011,9 @@ impl LspStore {
                 cx,
             );
         }
+
+        // Check if we should use cached tokens or request delta
+        let should_invalidate = invalidation_strategy.should_invalidate();
         let for_server = if let SemanticTokensInvalidationStrategy::RefreshRequested(server_id) =
             invalidation_strategy
         {
@@ -7127,12 +7022,14 @@ impl LspStore {
             None
         };
 
-        // Always try to use delta if we have result_id, even when invalidating
-        // Invalidation just forces the request, doesn't change delta → full
-        let result_id = self.latest_lsp_data(&buffer, cx)
-            .semantic_tokens
-            .as_ref()
-            .and_then(|data| data.result_id.clone());
+        let result_id = if !should_invalidate {
+            self.latest_lsp_data(&buffer, cx)
+                .semantic_tokens
+                .as_ref()
+                .and_then(|data| data.result_id.clone())
+        } else {
+            None
+        };
 
         if let Some(result_id) = result_id {
             if self.is_capable_for_proto_request(
@@ -7177,7 +7074,6 @@ impl LspStore {
                                     }
                                 };
                                 existing.semantic_tokens = Arc::new(semantic_tokens);
-                                existing.source = TokenSource::Full;
                             }
                         }
                     },
@@ -7197,7 +7093,6 @@ impl LspStore {
                     semantic_tokens.server_id = response.server_id;
                     data.semantic_tokens = Arc::new(semantic_tokens);
                     data.result_id = response.id;
-                    data.source = TokenSource::Full;
                 }
             },
         )
@@ -14129,69 +14024,5 @@ mod tests {
                 vec![(0..6, HighlightId(1))],
             )
         );
-    }
-
-    #[test]
-    fn test_semantic_tokens_priority_full_over_ranges() {
-        let mut data = SemanticTokensData::default();
-        
-        let range_tokens = Arc::new(SemanticTokens::from_full(vec![1, 2, 3]));
-        let full_tokens = Arc::new(SemanticTokens::from_full(vec![4, 5, 6]));
-        
-        data.semantic_tokens = range_tokens.clone();
-        data.source = TokenSource::Ranges;
-        
-        let stored_tokens_after_range = data.semantic_tokens.clone();
-        assert_eq!(stored_tokens_after_range.data(), &[1, 2, 3]);
-        assert_eq!(data.source, TokenSource::Ranges);
-        
-        data.semantic_tokens = full_tokens.clone();
-        data.source = TokenSource::Full;
-        
-        let stored_tokens_after_full = data.semantic_tokens.clone();
-        assert_eq!(stored_tokens_after_full.data(), &[4, 5, 6]);
-        assert_eq!(data.source, TokenSource::Full);
-        
-        let new_range_tokens = Arc::new(SemanticTokens::from_full(vec![7, 8, 9]));
-        if data.source != TokenSource::Full {
-            data.semantic_tokens = new_range_tokens.clone();
-            data.source = TokenSource::Ranges;
-        }
-        
-        let final_tokens = data.semantic_tokens.clone();
-        assert_eq!(final_tokens.data(), &[4, 5, 6]);
-        assert_eq!(data.source, TokenSource::Full);
-    }
-
-    #[test]
-    fn test_semantic_tokens_ranges_can_update_before_full() {
-        let mut data = SemanticTokensData::default();
-        
-        assert_eq!(data.source, TokenSource::None);
-        
-        let range_tokens_1 = Arc::new(SemanticTokens::from_full(vec![1, 2, 3]));
-        if data.source != TokenSource::Full {
-            data.semantic_tokens = range_tokens_1.clone();
-            data.source = TokenSource::Ranges;
-        }
-        
-        assert_eq!(data.semantic_tokens.data(), &[1, 2, 3]);
-        assert_eq!(data.source, TokenSource::Ranges);
-        
-        let range_tokens_2 = Arc::new(SemanticTokens::from_full(vec![4, 5, 6]));
-        if data.source != TokenSource::Full {
-            data.semantic_tokens = range_tokens_2.clone();
-            data.source = TokenSource::Ranges;
-        }
-        
-        assert_eq!(data.semantic_tokens.data(), &[4, 5, 6]);
-        assert_eq!(data.source, TokenSource::Ranges);
-    }
-
-    #[test]
-    fn test_semantic_tokens_source_default() {
-        let data = SemanticTokensData::default();
-        assert_eq!(data.source, TokenSource::None);
-        assert_eq!(data.result_id, None);
     }
 }
