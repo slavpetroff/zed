@@ -83,8 +83,19 @@ fn create_highlight_endpoints(
     buffer: &MultiBufferSnapshot,
 ) -> iter::Peekable<vec::IntoIter<HighlightEndpoint>> {
     // Pre-allocate with reasonable capacity to minimize reallocations
-    let capacity_hint =
-        text_highlights.map_or(0, |h| h.iter().map(|(_, v)| v.1.len()).sum::<usize>() * 2) + 64; // Extra space for token highlights
+    // Calculate capacity hint: text highlights need 2 endpoints per range
+    let mut capacity_hint =
+        text_highlights.map_or(0, |h| h.iter().map(|(_, v)| v.1.len()).sum::<usize>() * 2);
+
+    // Add estimate for semantic tokens: ~2 endpoints per token in visible excerpts
+    // Use a heuristic of total_tokens / 4 assuming visible range is roughly 1/4 of file
+    if let Some(tokens) = semantic_tokens {
+        capacity_hint += tokens
+            .values()
+            .map(|container| container.tokens.len() / 2)
+            .sum::<usize>();
+    }
+
     let mut highlight_endpoints = Vec::with_capacity(capacity_hint);
     if let Some(text_highlights) = text_highlights {
         let start = buffer.anchor_after(range.start);

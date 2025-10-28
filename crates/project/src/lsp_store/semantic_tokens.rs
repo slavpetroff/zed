@@ -7,7 +7,7 @@ use crate::lsp_command::SemanticTokensEdit;
 pub struct SemanticTokens {
     /// Each value is:
     /// data[5*i] - deltaLine: token line number, relative to the start of the previous token
-    /// data[5*i+1] - deltaStart: token start character, relative to the start of the previous token (relative to 0 or the previous token’s start if they are on the same line)
+    /// data[5*i+1] - deltaStart: token start character, relative to the start of the previous token (relative to 0 or the previous token's start if they are on the same line)
     /// data[5*i+2] - length: the length of the token.
     /// data[5*i+3] - tokenType: will be looked up in SemanticTokensLegend.tokenTypes. We currently ask that tokenType < 65536.
     /// data[5*i+4] - tokenModifiers: each set bit will be looked up in SemanticTokensLegend.tokenModifiers
@@ -16,6 +16,9 @@ pub struct SemanticTokens {
     data: Vec<u32>,
 
     pub server_id: Option<lsp::LanguageServerId>,
+
+    /// Cached count of tokens (data.len() / 5) for O(1) access.
+    token_count: usize,
 }
 
 pub struct SemanticTokensIter<'a> {
@@ -44,9 +47,11 @@ pub struct SemanticToken {
 
 impl SemanticTokens {
     pub fn from_full(data: Vec<u32>) -> Self {
+        let token_count = data.len() / 5;
         SemanticTokens {
             data,
             server_id: None,
+            token_count,
         }
     }
 
@@ -56,6 +61,13 @@ impl SemanticTokens {
             let end = start + edit.delete_count as usize;
             self.data.splice(start..end, edit.data.iter().copied());
         }
+        // Update cached token count after applying edits
+        self.token_count = self.data.len() / 5;
+    }
+
+    /// Returns the number of tokens in O(1) time.
+    pub fn token_count(&self) -> usize {
+        self.token_count
     }
 
     pub fn tokens(&self) -> SemanticTokensIter<'_> {

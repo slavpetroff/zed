@@ -70,8 +70,15 @@ impl SemanticTokenBufferContainer {
             })
             .collect::<Vec<_>>();
 
-        // These should be sorted, but we rely on it for binary searching, so let's be sure.
-        tokens.sort_by_key(|token| token.range.start);
+        // LSP spec guarantees tokens are sorted, but verify and sort if needed.
+        // Use is_sorted check (O(n)) to avoid unnecessary sort (O(n log n)) in common case.
+        if !tokens.is_sorted_by_key(|token| token.range.start) {
+            tokens.sort_unstable_by_key(|token| token.range.start);
+            log::debug!(
+                "Semantic tokens were not sorted for buffer, had to sort {} tokens",
+                tokens.len()
+            );
+        }
 
         Some(SemanticTokenBufferContainer {
             tokens,
@@ -81,15 +88,32 @@ impl SemanticTokenBufferContainer {
     }
 
     pub fn tokens_in_range(&self, range: Range<usize>) -> &[MultibufferSemanticToken] {
-        let start = self
+        if self.tokens.is_empty() {
+            return &[];
+        }
+
+        // Find the starting index, walking backwards to include tokens that start before
+        // the range but overlap into it (e.g., a token [10..50] overlaps range [30..40])
+        let start = match self
             .tokens
             .binary_search_by_key(&range.start, |token| token.range.start)
-            .unwrap_or_else(|next_ix| next_ix);
+        {
+            Ok(i) | Err(i) => {
+                let mut idx = i.min(self.tokens.len().saturating_sub(1));
+                // Walk backwards to find tokens that start before but end within or after range start
+                while idx > 0 && self.tokens[idx - 1].range.end > range.start {
+                    idx -= 1;
+                }
+                idx
+            }
+        };
 
-        let end = self
-            .tokens
+        // Find the ending index among remaining tokens
+        let end = match self.tokens[start..]
             .binary_search_by_key(&range.end, |token| token.range.start)
-            .unwrap_or_else(|next_ix| next_ix);
+        {
+            Ok(i) | Err(i) => start + i,
+        };
 
         &self.tokens[start..end]
     }

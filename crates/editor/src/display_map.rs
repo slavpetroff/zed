@@ -717,7 +717,7 @@ impl DisplayMap {
         // Check cache: skip regeneration if buffer version, token count, AND rainbow cache state unchanged
         // (token count check handles partial → full token transitions during LSP indexing)
         // (rainbow cache check ensures tokens are regenerated when rainbow highlighting is toggled)
-        let incoming_token_count = tokens.tokens().count();
+        let incoming_token_count = tokens.token_count();
         if let Some(cached_view) = self.semantic_tokens.get(&buffer_id) {
             let rainbow_cache_state_matches =
                 cached_view.had_rainbow_cache == variable_color_cache.is_some();
@@ -773,6 +773,14 @@ impl DisplayMap {
     #[cfg(test)]
     pub fn is_rewrapping(&self, cx: &gpui::App) -> bool {
         self.wrap_map.read(cx).is_rewrapping()
+    }
+
+    #[cfg(test)]
+    pub fn take_pending_semantic_token_task(
+        &mut self,
+        buffer_id: &text::BufferId,
+    ) -> Option<gpui::Task<()>> {
+        self.pending_semantic_token_tasks.remove(buffer_id)
     }
 }
 
