@@ -162,7 +162,7 @@ impl Editor {
         // Inlay hints doesn't have an early exit here for this reason.
         let mut visible_excerpts = self.visible_excerpts(cx);
 
-        log::debug!(
+        log::trace!(
             "[SEMANTIC TOKENS] refresh called with reason: {:?}, visible_excerpts() returned {} excerpts",
             reason,
             visible_excerpts.len()
@@ -180,7 +180,7 @@ impl Editor {
                 return;
             };
 
-            log::debug!(
+            log::trace!(
                 "[SEMANTIC TOKENS] BufferEdited for buffer {:?} with language {:?}, filtering visible excerpts by language",
                 buffer_id,
                 affected_language.name()
@@ -197,16 +197,14 @@ impl Editor {
         // Collect unique visible buffers that need semantic tokens
         let mut skipped_unregistered = 0;
         let mut skipped_failed = 0;
-        let mut all_visible_buffer_ids: Vec<BufferId> = Vec::new();
 
         for (_, (buffer, _, _)) in visible_excerpts {
             let buffer_id = buffer.read(cx).remote_id();
-            all_visible_buffer_ids.push(buffer_id);
 
             // Auto-register visible buffers that aren't registered yet
             // This ensures all visible buffers can get semantic tokens, not just the first one
             if !self.registered_buffers.contains_key(&buffer_id) {
-                log::debug!(
+                log::trace!(
                     "[SEMANTIC TOKENS] Auto-registering unregistered visible buffer {:?}",
                     buffer_id
                 );
@@ -233,20 +231,17 @@ impl Editor {
                 .or_insert_with(|| buffer.clone());
         }
 
-        log::debug!(
-            "[SEMANTIC TOKENS] ALL visible buffer IDs from excerpts: {:?}",
-            all_visible_buffer_ids
-        );
-        log::debug!(
-            "[SEMANTIC TOKENS] Collected {} unique buffers to fetch (skipped {} unregistered, {} failed): {:?}",
+        log::trace!(
+            "[SEMANTIC TOKENS] Collected {} unique buffers to fetch (skipped {} unregistered, {} failed)",
             buffers_to_fetch.len(),
             skipped_unregistered,
-            skipped_failed,
-            buffers_to_fetch.keys().collect::<Vec<_>>()
+            skipped_failed
         );
 
         // Spawn fetch tasks for collected buffers
-        let project = self.project.clone().unwrap();
+        let Some(project) = self.project.clone() else {
+            return;
+        };
         for (buffer_id, buffer) in buffers_to_fetch {
             // Check if we should replace an existing task
             // If a task exists and we're not invalidating/forcing, skip spawning a new one
@@ -256,14 +251,14 @@ impl Editor {
                 .get(&buffer_id)
             {
                 if !invalidation_strategy.should_invalidate() && !ignore_previous_fetches {
-                    log::debug!(
+                    log::trace!(
                         "[SEMANTIC TOKENS] Skipping buffer {:?} - task already exists",
                         buffer_id
                     );
                     continue;
                 }
                 // Task will be replaced below (dropped automatically)
-                log::debug!(
+                log::trace!(
                     "[SEMANTIC TOKENS] Replacing existing task for buffer {:?}",
                     buffer_id
                 );
@@ -291,7 +286,7 @@ impl Editor {
                             );
                             true
                         } else {
-                            log::debug!(
+                            log::trace!(
                                 "[SEMANTIC TOKENS] Successfully fetched tokens for buffer {buffer_id}"
                             );
                             false
@@ -305,23 +300,25 @@ impl Editor {
                     }
                 };
 
-                editor
-                    .update(cx, |editor, _| {
-                        editor.semantic_highlighting_state.refresh_tasks.remove(&buffer_id);
-                        if failed {
-                            let count = editor
-                                .semantic_highlighting_state
-                                .record_failure(buffer_id);
-                            if count >= 3 {
-                                log::warn!(
-                                    "Buffer {buffer_id} has failed semantic tokens {count} times, stopping automatic retries"
-                                );
-                            }
-                        } else {
-                            editor.semantic_highlighting_state.clear_failure(buffer_id);
+                if let Err(e) = editor.update(cx, |editor, _| {
+                    editor.semantic_highlighting_state.refresh_tasks.remove(&buffer_id);
+                    if failed {
+                        let count = editor
+                            .semantic_highlighting_state
+                            .record_failure(buffer_id);
+                        if count >= 3 {
+                            log::warn!(
+                                "Buffer {buffer_id} has failed semantic tokens {count} times, stopping automatic retries"
+                            );
                         }
-                    })
-                    .ok();
+                    } else {
+                        editor.semantic_highlighting_state.clear_failure(buffer_id);
+                    }
+                }) {
+                    log::trace!(
+                        "Editor was dropped while processing semantic tokens for buffer {buffer_id}: {e:#}"
+                    );
+                }
             });
 
             // Store task - replaces any existing task (which gets dropped/cancelled automatically)

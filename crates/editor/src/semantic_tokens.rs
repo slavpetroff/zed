@@ -346,7 +346,7 @@ impl<'a> SemanticTokenStylizer<'a> {
             token if token == SemanticTokenType::EVENT.as_str() => &["type.event", "type"],
 
             // Rust
-            token if token == "lifetime" => &["symbol", "type.parameter", "type"],
+            "lifetime" => &["symbol", "type.parameter", "type"],
 
             _ => {
                 return None;
