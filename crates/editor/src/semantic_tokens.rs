@@ -117,10 +117,7 @@ struct SemanticTokenStylizer<'a> {
 }
 
 impl<'a> SemanticTokenStylizer<'a> {
-    pub fn new(
-        legend: &'a lsp::SemanticTokensLegend,
-        rainbow_config: &'a RainbowConfig,
-    ) -> Self {
+    pub fn new(legend: &'a lsp::SemanticTokensLegend, rainbow_config: &'a RainbowConfig) -> Self {
         let token_types = legend.token_types.iter().map(|s| s.as_str()).collect();
         let modifier_mask = legend
             .token_modifiers

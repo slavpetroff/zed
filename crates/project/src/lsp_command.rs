@@ -247,11 +247,6 @@ pub(crate) struct SemanticTokensDelta {
     pub previous_result_id: String,
 }
 
-#[derive(Debug)]
-pub(crate) struct SemanticTokensRange {
-    pub range: Range<Anchor>,
-}
-
 #[derive(Default, Debug)]
 pub(crate) struct SemanticTokensFullResponse {
     pub data: Vec<u32>,

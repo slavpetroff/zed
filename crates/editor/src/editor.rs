@@ -36,7 +36,8 @@ mod rainbow; // Consolidated rainbow highlighting logic (includes caching)
 mod rust_analyzer_ext;
 pub mod scroll;
 mod selections_collection;
-mod semantic_tokens;
+mod semantic_highlighting; // Semantic token refresh and state management
+mod semantic_tokens; // Semantic token data structures and styling
 pub mod tasks;
 
 #[cfg(test)]
@@ -69,6 +70,7 @@ pub use multi_buffer::{
     Anchor, AnchorRangeExt, ExcerptId, ExcerptRange, MultiBuffer, MultiBufferSnapshot, PathKey,
     RowInfo, ToOffset, ToPoint,
 };
+pub use semantic_highlighting::SemanticTokenRefreshReason;
 pub use text::Bias;
 
 use ::git::{
@@ -146,7 +148,6 @@ use project::{
     BreakpointWithPosition, CodeAction, Completion, CompletionDisplayOptions, CompletionIntent,
     CompletionResponse, CompletionSource, DisableAiSettings, DocumentHighlight, InlayHint, InlayId,
     InvalidationStrategy, Location, LocationLink, PrepareRenameResponse, Project, ProjectItem,
-    lsp_store::semantic_token_cache::InvalidationStrategy as SemanticTokensInvalidationStrategy,
     ProjectPath, ProjectTransaction, TaskSourceKind,
     debugger::{
         breakpoint_store::{
@@ -156,6 +157,7 @@ use project::{
         session::{Session, SessionEvent},
     },
     git_store::GitStoreEvent,
+    lsp_store::semantic_token_cache::InvalidationStrategy as SemanticTokensInvalidationStrategy,
     lsp_store::{
         CacheInlayHints, CompletionDocumentation, FormatTrigger, LspFormatTarget,
         OpenLspBufferHandle, semantic_tokens::SemanticTokens,
@@ -1152,12 +1154,8 @@ pub struct Editor {
     next_scroll_position: NextScrollCursorCenterTopBottom,
     addons: HashMap<TypeId, Box<dyn Addon>>,
     registered_buffers: HashMap<BufferId, OpenLspBufferHandle>,
-    pending_semantic_token_requests: HashSet<BufferId>,
-    pending_semantic_token_buffers: Arc<Mutex<HashSet<BufferId>>>,
-    semantic_tokens_refresh_active: Arc<Mutex<bool>>,
-    semantic_tokens_refresh_task: Task<()>,
+    semantic_highlighting_state: semantic_highlighting::SemanticHighlightingState,
     last_rainbow_config: RainbowConfig,
-    last_semantic_tokens_max_lines: u32,
     load_diff_task: Option<Shared<Task<()>>>,
     /// Whether we are temporarily displaying a diff other than git's
     temporary_diff_override: bool,
@@ -1860,8 +1858,7 @@ impl Editor {
                     }
                     project::Event::RefreshSemanticTokens(server_id) => {
                         editor.refresh_semantic_tokens(
-                            None,
-                            SemanticTokensInvalidationStrategy::RefreshRequested(*server_id),
+                            SemanticTokenRefreshReason::RefreshRequested(*server_id),
                             cx,
                         );
                     }
@@ -1877,8 +1874,7 @@ impl Editor {
                         editor.registered_buffers.clear();
                         editor.register_visible_buffers(cx);
                         editor.refresh_semantic_tokens(
-                            None,
-                            SemanticTokensInvalidationStrategy::BufferEdited,
+                            SemanticTokenRefreshReason::SettingsChanged,
                             cx,
                         );
                     }
@@ -1912,20 +1908,16 @@ impl Editor {
                             editor.refresh_code_actions(window, cx);
                             editor.refresh_document_highlights(cx);
                             editor.refresh_semantic_tokens(
-                                Some(buffer_id),
-                                SemanticTokensInvalidationStrategy::None,
+                                SemanticTokenRefreshReason::BufferEdited(buffer_id),
                                 cx,
                             );
                         }
                     }
 
-                    project::Event::LanguageServerIndexingComplete {
-                        language_server_id,
-                    } => {
+                    project::Event::LanguageServerIndexingComplete { language_server_id } => {
                         // Force full refresh after indexing to get new cross-file analysis
                         editor.refresh_semantic_tokens(
-                            None,
-                            SemanticTokensInvalidationStrategy::RefreshRequested(*language_server_id),
+                            SemanticTokenRefreshReason::RefreshRequested(*language_server_id),
                             cx,
                         );
                     }
@@ -2265,13 +2257,8 @@ impl Editor {
             next_scroll_position: NextScrollCursorCenterTopBottom::default(),
             addons: HashMap::default(),
             registered_buffers: HashMap::default(),
-            pending_semantic_token_requests: HashSet::default(),
-            pending_semantic_token_buffers: Arc::new(Mutex::new(HashSet::default())),
-            semantic_tokens_refresh_active: Arc::new(Mutex::new(false)),
-            semantic_tokens_refresh_task: Task::ready(()),
+            semantic_highlighting_state: semantic_highlighting::SemanticHighlightingState::new(),
             last_rainbow_config: EditorSettings::get_global(cx).rainbow_highlighting.clone(),
-            last_semantic_tokens_max_lines: EditorSettings::get_global(cx)
-                .semantic_tokens_max_file_lines,
             _scroll_cursor_center_top_bottom_task: Task::ready(()),
             selection_mark_mode: false,
             toggle_fold_multiple_buffers: Task::ready(()),
@@ -20915,8 +20902,7 @@ impl Editor {
                             cx,
                         );
                         self.refresh_semantic_tokens(
-                            Some(buffer_id),
-                            SemanticTokensInvalidationStrategy::BufferEdited,
+                            SemanticTokenRefreshReason::BufferEdited(buffer_id),
                             cx,
                         );
                     }
@@ -20958,11 +20944,7 @@ impl Editor {
                 self.register_buffer(buffer_id, cx);
                 self.update_lsp_data(Some(buffer_id), window, cx);
                 self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
-                self.refresh_semantic_tokens(
-                    Some(buffer_id),
-                    SemanticTokensInvalidationStrategy::None,
-                    cx,
-                );
+                self.refresh_semantic_tokens(SemanticTokenRefreshReason::NewLinesShown, cx);
 
                 cx.emit(EditorEvent::ExcerptsAdded {
                     buffer: buffer.clone(),
@@ -20997,6 +20979,7 @@ impl Editor {
                 self.display_map.update(cx, |map, cx| {
                     map.unfold_buffers(buffer_ids.iter().copied(), cx)
                 });
+
                 cx.emit(EditorEvent::ExcerptsEdited {
                     ids: excerpt_ids.clone(),
                 });
@@ -21004,15 +20987,15 @@ impl Editor {
             multi_buffer::Event::ExcerptsExpanded { ids } => {
                 self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
                 self.refresh_document_highlights(cx);
-                self.refresh_semantic_tokens(
-                    None,
-                    SemanticTokensInvalidationStrategy::None,
-                    cx,
-                );
+                self.refresh_semantic_tokens(SemanticTokenRefreshReason::NewLinesShown, cx);
                 cx.emit(EditorEvent::ExcerptsExpanded { ids: ids.clone() })
             }
             multi_buffer::Event::Reparsed(buffer_id) => {
                 self.tasks_update_task = Some(self.refresh_runnables(window, cx));
+                self.refresh_semantic_tokens(
+                    SemanticTokenRefreshReason::BufferEdited(*buffer_id),
+                    cx,
+                );
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
             }
             multi_buffer::Event::DiffHunksToggled => {
@@ -21023,8 +21006,7 @@ impl Editor {
                 self.register_buffer(*buffer_id, cx);
                 self.update_lsp_data(Some(*buffer_id), window, cx);
                 self.refresh_semantic_tokens(
-                    Some(*buffer_id),
-                    SemanticTokensInvalidationStrategy::BufferEdited,
+                    SemanticTokenRefreshReason::BufferEdited(*buffer_id),
                     cx,
                 );
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
@@ -21109,11 +21091,8 @@ impl Editor {
         );
 
         let rainbow_config = EditorSettings::get_global(cx).rainbow_highlighting.clone();
-        let semantic_tokens_max_lines =
-            EditorSettings::get_global(cx).semantic_tokens_max_file_lines;
 
         let rainbow_changed = rainbow_config != self.last_rainbow_config;
-        let max_lines_changed = semantic_tokens_max_lines != self.last_semantic_tokens_max_lines;
 
         if rainbow_changed {
             self.display_map.update(cx, |display_map, _| {
@@ -21127,15 +21106,7 @@ impl Editor {
                 display_map.set_variable_color_cache(cache);
             });
             self.last_rainbow_config = rainbow_config;
-        }
-
-        if rainbow_changed || max_lines_changed {
-            self.last_semantic_tokens_max_lines = semantic_tokens_max_lines;
-            self.refresh_semantic_tokens(
-                None,
-                SemanticTokensInvalidationStrategy::BufferEdited,
-                cx,
-            );
+            self.refresh_semantic_tokens(SemanticTokenRefreshReason::SettingsChanged, cx);
         }
 
         let old_cursor_shape = self.cursor_shape;
@@ -22075,160 +22046,6 @@ impl Editor {
                 self.registered_buffers.remove(&buffer_id);
             }
         }
-    }
-
-    fn refresh_semantic_tokens(
-        &mut self,
-        for_buffer: Option<BufferId>,
-        invalidation: SemanticTokensInvalidationStrategy,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(project) = self.project.as_ref() else {
-            return;
-        };
-
-        let buffer_ids: Vec<BufferId> = if let Some(buffer_id) = for_buffer {
-            vec![buffer_id]
-        } else {
-            self.visible_excerpts(cx)
-                .into_values()
-                .map(|(buffer, _, _)| buffer.read(cx).remote_id())
-                .collect()
-        };
-
-        let mut pending = self.pending_semantic_token_buffers.lock();
-        pending.extend(buffer_ids);
-        drop(pending);
-
-        let mut active = self.semantic_tokens_refresh_active.lock();
-        if *active {
-            return;
-        }
-        *active = true;
-        drop(active);
-
-        let pending_buffers = self.pending_semantic_token_buffers.clone();
-        let refresh_active = self.semantic_tokens_refresh_active.clone();
-        let multibuffer = self.buffer.clone();
-        let project = project.clone();
-
-        self.semantic_tokens_refresh_task = cx.spawn(async move |editor, cx| {
-            const DEBOUNCE_SMALL: u64 = 50;
-            const DEBOUNCE_MEDIUM: u64 = 100;
-            const DEBOUNCE_LARGE: u64 = 200;
-            const MEDIUM_BATCH_THRESHOLD: usize = 3;
-            const LARGE_BATCH_THRESHOLD: usize = 10;
-
-            loop {
-                let pending_count = pending_buffers.lock().len();
-                let debounce_ms = if pending_count > LARGE_BATCH_THRESHOLD {
-                    DEBOUNCE_LARGE
-                } else if pending_count > MEDIUM_BATCH_THRESHOLD {
-                    DEBOUNCE_MEDIUM
-                } else {
-                    DEBOUNCE_SMALL
-                };
-                cx.background_executor()
-                    .timer(Duration::from_millis(debounce_ms))
-                    .await;
-
-                const MAX_BUFFERS_PER_SESSION: usize = 50;
-                const LARGE_BATCH_SIZE: usize = 20;
-                const CHUNK_SIZE_NORMAL: usize = 5;
-                const CHUNK_SIZE_LARGE: usize = 3;
-
-                let buffers_to_process: Vec<BufferId> = {
-                    let mut pending = pending_buffers.lock();
-                    let mut buffers: Vec<_> = pending.drain().collect();
-
-                    if buffers.len() > MAX_BUFFERS_PER_SESSION {
-                        log::warn!(
-                            "Semantic tokens requested for {} buffers, capping at {}",
-                            buffers.len(),
-                            MAX_BUFFERS_PER_SESSION
-                        );
-                        buffers.truncate(MAX_BUFFERS_PER_SESSION);
-                    }
-                    buffers
-                };
-
-                if buffers_to_process.is_empty() {
-                    *refresh_active.lock() = false;
-                    return;
-                }
-
-                let chunk_size = if buffers_to_process.len() > LARGE_BATCH_SIZE {
-                    CHUNK_SIZE_LARGE
-                } else {
-                    CHUNK_SIZE_NORMAL
-                };
-
-                for chunk in buffers_to_process.chunks(chunk_size) {
-                    let chunk_tasks: Vec<_> = editor
-                        .update(cx, |editor, cx| {
-                            let mut tasks = Vec::new();
-                            for &buffer_id in chunk {
-                                let Some(buffer) = multibuffer.read(cx).buffer(buffer_id) else {
-                                    continue;
-                                };
-
-                                if editor.pending_semantic_token_requests.contains(&buffer_id) {
-                                    continue;
-                                }
-
-                                let max_lines = EditorSettings::get_global(cx).semantic_tokens_max_file_lines;
-                                let line_count = buffer.read(cx).max_point().row + 1;
-                                if line_count > max_lines {
-                                    continue;
-                                }
-                                editor.pending_semantic_token_requests.insert(buffer_id);
-
-                                let project = project.clone();
-                                let task = cx.spawn(async move |editor, cx| {
-                                    let Some(lsp_task) = project
-                                        .update(cx, |project, cx| {
-                                            project
-                                                .lsp_store()
-                                                .update(cx, |store, cx| store.semantic_tokens(buffer, invalidation, cx))
-                                        })
-                                        .log_err()
-                                    else {
-                                        editor
-                                            .update(cx, |editor, _cx| {
-                                                editor.pending_semantic_token_requests.remove(&buffer_id);
-                                            })
-                                            .log_err();
-                                        return;
-                                    };
-
-                                    match lsp_task.await {
-                                        Ok(tokens) if tokens.server_id.is_some() => {}
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            log::warn!("Failed to fetch semantic tokens for buffer {buffer_id}: {e:#}");
-                                        }
-                                    }
-
-                                    editor
-                                        .update(cx, |editor, _cx| {
-                                            editor.pending_semantic_token_requests.remove(&buffer_id);
-                                        })
-                                        .log_err();
-                                });
-
-                                tasks.push(task);
-                            }
-                            tasks
-                        })
-                        .log_err()
-                        .unwrap_or_default();
-
-                    for task in chunk_tasks {
-                        task.await;
-                    }
-                }
-            }
-        });
     }
 
     fn ignore_lsp_data(&self) -> bool {
@@ -23475,11 +23292,7 @@ impl SemanticsProvider for Entity<Project> {
     ) -> Option<Task<anyhow::Result<Arc<SemanticTokens>>>> {
         Some(self.update(cx, |project, cx| {
             // Default to no invalidation when called from DisplayMap
-            project.semantic_tokens(
-                buffer_handle,
-                SemanticTokensInvalidationStrategy::None,
-                cx,
-            )
+            project.semantic_tokens(buffer_handle, SemanticTokensInvalidationStrategy::None, cx)
         }))
     }
 

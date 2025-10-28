@@ -48,16 +48,16 @@ use gpui::{
 use inlay_map::InlaySnapshot;
 pub use inlay_map::{InlayOffset, InlayPoint};
 pub use invisibles::{is_invisible, replacement};
-use language::{OffsetUtf16, Point, Subscription as BufferSubscription, language_settings::language_settings};
+use language::{
+    OffsetUtf16, Point, Subscription as BufferSubscription, language_settings::language_settings,
+};
 use multi_buffer::{
     Anchor, AnchorRangeExt, ExcerptId, MultiBuffer, MultiBufferPoint, MultiBufferRow,
     MultiBufferSnapshot, RowInfo, ToOffset, ToPoint,
 };
 use project::InlayId;
-use project::{
-    Project, project_settings::DiagnosticSeverity,
-};
 use project::lsp_store::semantic_tokens::SemanticTokens;
+use project::{Project, project_settings::DiagnosticSeverity};
 use serde::Deserialize;
 use settings::Settings;
 use util::ResultExt;

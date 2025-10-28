@@ -6864,20 +6864,40 @@ impl LspStore {
     pub fn semantic_tokens(
         &mut self,
         buffer: Entity<Buffer>,
-        invalidatetion_strategy: SemanticTokensInvalidationStrategy,
+        invalidation_strategy: SemanticTokensInvalidationStrategy,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Arc<SemanticTokens>>> {
         let buffer_id = buffer.read(cx).remote_id();
+        let should_invalidate = invalidation_strategy.should_invalidate();
 
-        // Check if we should use cached tokens or request delta
-        let should_invalidate = invalidatetion_strategy.should_invalidate();
-        let _for_server = if let SemanticTokensInvalidationStrategy::RefreshRequested(server_id) =
-            invalidatetion_strategy
-        {
-            Some(server_id)
+        // Return cached tokens immediately if not invalidating
+        // Empty tokens are valid (files with no highlightable content)
+        if !should_invalidate {
+            if let Some(cached) = self
+                .lsp_data
+                .get(&buffer_id)
+                .and_then(|d| d.semantic_tokens.as_ref())
+            {
+                if cached.semantic_tokens.server_id.is_some() {
+                    log::debug!(
+                        "[CACHE HIT] Returning cached semantic tokens for buffer {}: {} tokens",
+                        buffer_id,
+                        cached.semantic_tokens.tokens().count()
+                    );
+                    return Task::ready(Ok(cached.semantic_tokens.clone()));
+                }
+            }
+            log::debug!(
+                "[CACHE MISS] No cached semantic tokens for buffer {}",
+                buffer_id
+            );
         } else {
-            None
-        };
+            log::debug!(
+                "[CACHE INVALIDATE] Invalidating semantic tokens for buffer {}: {:?}",
+                buffer_id,
+                invalidation_strategy
+            );
+        }
 
         let result_id = if !should_invalidate {
             self.latest_lsp_data(&buffer, cx)
@@ -6896,6 +6916,10 @@ impl LspStore {
                 },
                 cx,
             ) {
+                log::debug!(
+                    "[LSP REQUEST] Sending DELTA semantic tokens request for buffer {}",
+                    buffer_id
+                );
                 return self.send_semantic_tokens_request(
                     buffer,
                     cx,
@@ -6937,6 +6961,10 @@ impl LspStore {
             }
         }
 
+        log::debug!(
+            "[LSP REQUEST] Sending FULL semantic tokens request for buffer {}",
+            buffer_id
+        );
         self.send_semantic_tokens_request(buffer, cx, SemanticTokensFull, move |response, store| {
             if let Some(lsp_data) = store.lsp_data.get_mut(&buffer_id) {
                 let data = lsp_data.semantic_tokens.get_or_insert_default();
@@ -6980,6 +7008,9 @@ impl LspStore {
                 .context("semantic tokens proto response conversion")?;
 
                 store.upgrade().unwrap().update(cx, move |store, cx| {
+                    // Ensure lsp_data exists before handling response
+                    store.latest_lsp_data(&buffer, cx);
+                    
                     handle_response(response, store);
 
                     let tokens = store
@@ -6991,6 +7022,8 @@ impl LspStore {
                             anyhow::anyhow!("No semantic tokens after response handling")
                         })?;
 
+                    // Empty tokens are valid (e.g., small files, no highlightable content)
+                    // Store them anyway and let the editor handle gracefully
                     if let Some(server_id) = tokens.server_id {
                         if let Some(caps) = store.lsp_server_capabilities.get(&server_id) {
                             if let Some(provider) = &caps.semantic_tokens_provider {
@@ -7012,14 +7045,21 @@ impl LspStore {
                 })?
             })
         } else {
-            let lsp_request_task =
-                self.request_lsp(buffer, LanguageServerToQuery::FirstCapable, request, cx);
+            let lsp_request_task = self.request_lsp(
+                buffer.clone(),
+                LanguageServerToQuery::FirstCapable,
+                request,
+                cx,
+            );
             cx.spawn(async move |store, cx| {
                 let response = lsp_request_task
                     .await
                     .context("semantic tokens LSP request")?;
 
                 store.upgrade().unwrap().update(cx, move |store, cx| {
+                    // Ensure lsp_data exists before handling response
+                    store.latest_lsp_data(&buffer, cx);
+                    
                     handle_response(response, store);
 
                     let tokens = store
@@ -7031,6 +7071,8 @@ impl LspStore {
                             anyhow::anyhow!("No semantic tokens after response handling")
                         })?;
 
+                    // Empty tokens are valid (e.g., small files, no highlightable content)
+                    // Store them anyway and let the editor handle gracefully
                     if let Some(server_id) = tokens.server_id {
                         if let Some(caps) = store.lsp_server_capabilities.get(&server_id) {
                             if let Some(provider) = &caps.semantic_tokens_provider {

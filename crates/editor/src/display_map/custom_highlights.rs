@@ -11,7 +11,10 @@ use std::{
 };
 use text::BufferId;
 
-use crate::{display_map::{HighlightKey, TextHighlights}, semantic_tokens::SemanticTokenBufferContainer};
+use crate::{
+    display_map::{HighlightKey, TextHighlights},
+    semantic_tokens::SemanticTokenBufferContainer,
+};
 
 pub struct CustomHighlightsChunks<'a> {
     buffer_chunks: MultiBufferChunks<'a>,
