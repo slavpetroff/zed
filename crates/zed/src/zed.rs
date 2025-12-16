@@ -5020,6 +5020,7 @@ mod tests {
             debugger_ui::init(cx);
             initialize_workspace(app_state.clone(), prompt_builder, cx);
             search::init(cx);
+            quick_search::init(cx);
             app_state
         })
     }
