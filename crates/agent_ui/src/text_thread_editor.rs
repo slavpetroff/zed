@@ -2,15 +2,15 @@ use crate::{
     language_model_selector::{LanguageModelSelector, language_model_selector},
     ui::BurnModeTooltip,
 };
-use agent_settings::CompletionMode;
+use agent_settings::{AgentSettings, CompletionMode};
 use anyhow::Result;
 use assistant_slash_command::{SlashCommand, SlashCommandOutputSection, SlashCommandWorkingSet};
 use assistant_slash_commands::{DefaultSlashCommand, FileSlashCommand, selections_creases};
 use client::{proto, zed_urls};
 use collections::{BTreeSet, HashMap, HashSet, hash_map};
 use editor::{
-    Anchor, Editor, EditorEvent, MenuEditPredictionsPolicy, MultiBuffer, MultiBufferSnapshot,
-    RowExt, ToOffset as _, ToPoint,
+    Anchor, Editor, EditorEvent, MenuEditPredictionsPolicy, MultiBuffer, MultiBufferOffset,
+    MultiBufferSnapshot, RowExt, ToOffset as _, ToPoint,
     actions::{MoveToEndOfLine, Newline, ShowCompletions},
     display_map::{
         BlockPlacement, BlockProperties, BlockStyle, Crease, CreaseMetadata, CustomBlockId, FoldId,
@@ -22,11 +22,11 @@ use editor::{FoldPlaceholder, display_map::CreaseId};
 use fs::Fs;
 use futures::FutureExt;
 use gpui::{
-    Action, Animation, AnimationExt, AnyElement, AnyView, App, ClipboardEntry, ClipboardItem,
-    Empty, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Global, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, RenderImage, SharedString, Size,
-    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, actions, div, img, point,
-    prelude::*, pulsating_between, size,
+    Action, Animation, AnimationExt, AnyElement, App, ClipboardEntry, ClipboardItem, Empty, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, Global, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, RenderImage, SharedString, Size, StatefulInteractiveElement,
+    Styled, Subscription, Task, WeakEntity, actions, div, img, point, prelude::*,
+    pulsating_between, size,
 };
 use language::{
     BufferSnapshot, LspAdapterDelegate, ToOffset,
@@ -66,18 +66,20 @@ use workspace::{
 };
 use workspace::{
     Save, Toast, Workspace,
-    item::{self, FollowableItem, Item, ItemHandle},
+    item::{self, FollowableItem, Item},
     notifications::NotificationId,
     pane,
     searchable::{SearchEvent, SearchableItem},
 };
 use zed_actions::agent::{AddSelectionToThread, ToggleModelSelector};
 
+use crate::CycleFavoriteModels;
+
 use crate::{slash_command::SlashCommandCompletionProvider, slash_command_picker};
-use assistant_context::{
-    AssistantContext, CacheStatus, Content, ContextEvent, ContextId, InvokedSlashCommandId,
-    InvokedSlashCommandStatus, Message, MessageId, MessageMetadata, MessageStatus,
-    PendingSlashCommandStatus, ThoughtProcessOutputSection,
+use assistant_text_thread::{
+    CacheStatus, Content, InvokedSlashCommandId, InvokedSlashCommandStatus, Message, MessageId,
+    MessageMetadata, MessageStatus, PendingSlashCommandStatus, TextThread, TextThreadEvent,
+    TextThreadId, ThoughtProcessOutputSection,
 };
 
 actions!(
@@ -126,14 +128,14 @@ pub enum ThoughtProcessStatus {
 }
 
 pub trait AgentPanelDelegate {
-    fn active_context_editor(
+    fn active_text_thread_editor(
         &self,
         workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Option<Entity<TextThreadEditor>>;
 
-    fn open_saved_context(
+    fn open_local_text_thread(
         &self,
         workspace: &mut Workspace,
         path: Arc<Path>,
@@ -141,10 +143,10 @@ pub trait AgentPanelDelegate {
         cx: &mut Context<Workspace>,
     ) -> Task<Result<()>>;
 
-    fn open_remote_context(
+    fn open_remote_text_thread(
         &self,
         workspace: &mut Workspace,
-        context_id: ContextId,
+        text_thread_id: TextThreadId,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<Result<Entity<TextThreadEditor>>>;
@@ -177,7 +179,7 @@ struct GlobalAssistantPanelDelegate(Arc<dyn AgentPanelDelegate>);
 impl Global for GlobalAssistantPanelDelegate {}
 
 pub struct TextThreadEditor {
-    context: Entity<AssistantContext>,
+    text_thread: Entity<TextThread>,
     fs: Arc<dyn Fs>,
     slash_commands: Arc<SlashCommandWorkingSet>,
     workspace: WeakEntity<Workspace>,
@@ -223,8 +225,8 @@ impl TextThreadEditor {
         .detach();
     }
 
-    pub fn for_context(
-        context: Entity<AssistantContext>,
+    pub fn for_text_thread(
+        text_thread: Entity<TextThread>,
         fs: Arc<dyn Fs>,
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
@@ -233,14 +235,14 @@ impl TextThreadEditor {
         cx: &mut Context<Self>,
     ) -> Self {
         let completion_provider = SlashCommandCompletionProvider::new(
-            context.read(cx).slash_commands().clone(),
+            text_thread.read(cx).slash_commands().clone(),
             Some(cx.entity().downgrade()),
             Some(workspace.clone()),
         );
 
         let editor = cx.new(|cx| {
             let mut editor =
-                Editor::for_buffer(context.read(cx).buffer().clone(), None, window, cx);
+                Editor::for_buffer(text_thread.read(cx).buffer().clone(), None, window, cx);
             editor.disable_scrollbars_and_minimap(window, cx);
             editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
             editor.set_show_line_numbers(false, cx);
@@ -264,18 +266,26 @@ impl TextThreadEditor {
         });
 
         let _subscriptions = vec![
-            cx.observe(&context, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&context, window, Self::handle_context_event),
+            cx.observe(&text_thread, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&text_thread, window, Self::handle_text_thread_event),
             cx.subscribe_in(&editor, window, Self::handle_editor_event),
             cx.subscribe_in(&editor, window, Self::handle_editor_search_event),
             cx.observe_global_in::<SettingsStore>(window, Self::settings_changed),
         ];
 
-        let slash_command_sections = context.read(cx).slash_command_output_sections().to_vec();
-        let thought_process_sections = context.read(cx).thought_process_output_sections().to_vec();
-        let slash_commands = context.read(cx).slash_commands().clone();
+        let slash_command_sections = text_thread
+            .read(cx)
+            .slash_command_output_sections()
+            .to_vec();
+        let thought_process_sections = text_thread
+            .read(cx)
+            .thought_process_output_sections()
+            .to_vec();
+        let slash_commands = text_thread.read(cx).slash_commands().clone();
+        let focus_handle = editor.read(cx).focus_handle(cx);
+
         let mut this = Self {
-            context,
+            text_thread,
             slash_commands,
             editor,
             lsp_adapter_delegate,
@@ -296,18 +306,34 @@ impl TextThreadEditor {
             language_model_selector: cx.new(|cx| {
                 language_model_selector(
                     |cx| LanguageModelRegistry::read_global(cx).default_model(),
-                    move |model, cx| {
-                        update_settings_file(fs.clone(), cx, move |settings, _| {
-                            let provider = model.provider_id().0.to_string();
-                            let model = model.id().0.to_string();
-                            settings.agent.get_or_insert_default().set_model(
-                                LanguageModelSelection {
-                                    provider: LanguageModelProviderSetting(provider),
-                                    model,
-                                },
-                            )
-                        });
+                    {
+                        let fs = fs.clone();
+                        move |model, cx| {
+                            update_settings_file(fs.clone(), cx, move |settings, _| {
+                                let provider = model.provider_id().0.to_string();
+                                let model = model.id().0.to_string();
+                                settings.agent.get_or_insert_default().set_model(
+                                    LanguageModelSelection {
+                                        provider: LanguageModelProviderSetting(provider),
+                                        model,
+                                    },
+                                )
+                            });
+                        }
                     },
+                    {
+                        let fs = fs.clone();
+                        move |model, should_be_favorite, cx| {
+                            crate::favorite_models::toggle_in_settings(
+                                model,
+                                should_be_favorite,
+                                fs.clone(),
+                                cx,
+                            );
+                        }
+                    },
+                    true, // Use popover styles for picker
+                    focus_handle,
                     window,
                     cx,
                 )
@@ -337,8 +363,8 @@ impl TextThreadEditor {
         });
     }
 
-    pub fn context(&self) -> &Entity<AssistantContext> {
-        &self.context
+    pub fn text_thread(&self) -> &Entity<TextThread> {
+        &self.text_thread
     }
 
     pub fn editor(&self) -> &Entity<Editor> {
@@ -350,9 +376,9 @@ impl TextThreadEditor {
         self.editor.update(cx, |editor, cx| {
             editor.insert(&format!("/{command_name}\n\n"), window, cx)
         });
-        let command = self.context.update(cx, |context, cx| {
-            context.reparse(cx);
-            context.parsed_slash_commands()[0].clone()
+        let command = self.text_thread.update(cx, |text_thread, cx| {
+            text_thread.reparse(cx);
+            text_thread.parsed_slash_commands()[0].clone()
         });
         self.run_command(
             command.source_range,
@@ -375,12 +401,15 @@ impl TextThreadEditor {
 
     fn send_to_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.last_error = None;
-        if let Some(user_message) = self.context.update(cx, |context, cx| context.assist(cx)) {
+        if let Some(user_message) = self
+            .text_thread
+            .update(cx, |text_thread, cx| text_thread.assist(cx))
+        {
             let new_selection = {
                 let cursor = user_message
                     .start
-                    .to_offset(self.context.read(cx).buffer().read(cx));
-                cursor..cursor
+                    .to_offset(self.text_thread.read(cx).buffer().read(cx));
+                MultiBufferOffset(cursor)..MultiBufferOffset(cursor)
             };
             self.editor.update(cx, |editor, cx| {
                 editor.change_selections(Default::default(), window, cx, |selections| {
@@ -403,8 +432,8 @@ impl TextThreadEditor {
         self.last_error = None;
 
         if self
-            .context
-            .update(cx, |context, cx| context.cancel_last_assist(cx))
+            .text_thread
+            .update(cx, |text_thread, cx| text_thread.cancel_last_assist(cx))
         {
             return;
         }
@@ -419,19 +448,21 @@ impl TextThreadEditor {
         cx: &mut Context<Self>,
     ) {
         let cursors = self.cursors(cx);
-        self.context.update(cx, |context, cx| {
-            let messages = context
-                .messages_for_offsets(cursors, cx)
+        self.text_thread.update(cx, |text_thread, cx| {
+            let messages = text_thread
+                .messages_for_offsets(cursors.into_iter().map(|cursor| cursor.0), cx)
                 .into_iter()
                 .map(|message| message.id)
                 .collect();
-            context.cycle_message_roles(messages, cx)
+            text_thread.cycle_message_roles(messages, cx)
         });
     }
 
-    fn cursors(&self, cx: &mut App) -> Vec<usize> {
+    fn cursors(&self, cx: &mut App) -> Vec<MultiBufferOffset> {
         let selections = self.editor.update(cx, |editor, cx| {
-            editor.selections.all::<usize>(&editor.display_snapshot(cx))
+            editor
+                .selections
+                .all::<MultiBufferOffset>(&editor.display_snapshot(cx))
         });
         selections
             .into_iter()
@@ -468,7 +499,7 @@ impl TextThreadEditor {
                     editor.insert(&format!("/{name}"), window, cx);
                     if command.accepts_arguments() {
                         editor.insert(" ", window, cx);
-                        editor.show_completions(&ShowCompletions::default(), window, cx);
+                        editor.show_completions(&ShowCompletions, window, cx);
                     }
                 });
             });
@@ -491,11 +522,11 @@ impl TextThreadEditor {
         let selections = self.editor.read(cx).selections.disjoint_anchors_arc();
         let mut commands_by_range = HashMap::default();
         let workspace = self.workspace.clone();
-        self.context.update(cx, |context, cx| {
-            context.reparse(cx);
+        self.text_thread.update(cx, |text_thread, cx| {
+            text_thread.reparse(cx);
             for selection in selections.iter() {
                 if let Some(command) =
-                    context.pending_command_for_position(selection.head().text_anchor, cx)
+                    text_thread.pending_command_for_position(selection.head().text_anchor, cx)
                 {
                     commands_by_range
                         .entry(command.source_range.clone())
@@ -533,14 +564,14 @@ impl TextThreadEditor {
         cx: &mut Context<Self>,
     ) {
         if let Some(command) = self.slash_commands.command(name, cx) {
-            let context = self.context.read(cx);
-            let sections = context
+            let text_thread = self.text_thread.read(cx);
+            let sections = text_thread
                 .slash_command_output_sections()
                 .iter()
-                .filter(|section| section.is_valid(context.buffer().read(cx)))
+                .filter(|section| section.is_valid(text_thread.buffer().read(cx)))
                 .cloned()
                 .collect::<Vec<_>>();
-            let snapshot = context.buffer().read(cx).snapshot();
+            let snapshot = text_thread.buffer().read(cx).snapshot();
             let output = command.run(
                 arguments,
                 &sections,
@@ -550,8 +581,8 @@ impl TextThreadEditor {
                 window,
                 cx,
             );
-            self.context.update(cx, |context, cx| {
-                context.insert_command_output(
+            self.text_thread.update(cx, |text_thread, cx| {
+                text_thread.insert_command_output(
                     command_range,
                     name,
                     output,
@@ -562,32 +593,32 @@ impl TextThreadEditor {
         }
     }
 
-    fn handle_context_event(
+    fn handle_text_thread_event(
         &mut self,
-        _: &Entity<AssistantContext>,
-        event: &ContextEvent,
+        _: &Entity<TextThread>,
+        event: &TextThreadEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let context_editor = cx.entity().downgrade();
+        let text_thread_editor = cx.entity().downgrade();
 
         match event {
-            ContextEvent::MessagesEdited => {
+            TextThreadEvent::MessagesEdited => {
                 self.update_message_headers(cx);
                 self.update_image_blocks(cx);
-                self.context.update(cx, |context, cx| {
-                    context.save(Some(Duration::from_millis(500)), self.fs.clone(), cx);
+                self.text_thread.update(cx, |text_thread, cx| {
+                    text_thread.save(Some(Duration::from_millis(500)), self.fs.clone(), cx);
                 });
             }
-            ContextEvent::SummaryChanged => {
+            TextThreadEvent::SummaryChanged => {
                 cx.emit(EditorEvent::TitleChanged);
-                self.context.update(cx, |context, cx| {
-                    context.save(Some(Duration::from_millis(500)), self.fs.clone(), cx);
+                self.text_thread.update(cx, |text_thread, cx| {
+                    text_thread.save(Some(Duration::from_millis(500)), self.fs.clone(), cx);
                 });
             }
-            ContextEvent::SummaryGenerated => {}
-            ContextEvent::PathChanged { .. } => {}
-            ContextEvent::StartedThoughtProcess(range) => {
+            TextThreadEvent::SummaryGenerated => {}
+            TextThreadEvent::PathChanged { .. } => {}
+            TextThreadEvent::StartedThoughtProcess(range) => {
                 let creases = self.insert_thought_process_output_sections(
                     [(
                         ThoughtProcessOutputSection {
@@ -600,7 +631,7 @@ impl TextThreadEditor {
                 );
                 self.pending_thought_process = Some((creases[0], range.start));
             }
-            ContextEvent::EndedThoughtProcess(end) => {
+            TextThreadEvent::EndedThoughtProcess(end) => {
                 if let Some((crease_id, start)) = self.pending_thought_process.take() {
                     self.editor.update(cx, |editor, cx| {
                         let multi_buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -626,7 +657,7 @@ impl TextThreadEditor {
                     );
                 }
             }
-            ContextEvent::StreamedCompletion => {
+            TextThreadEvent::StreamedCompletion => {
                 self.editor.update(cx, |editor, cx| {
                     if let Some(scroll_position) = self.scroll_position {
                         let snapshot = editor.snapshot(window, cx);
@@ -641,7 +672,7 @@ impl TextThreadEditor {
                     }
                 });
             }
-            ContextEvent::ParsedSlashCommandsUpdated { removed, updated } => {
+            TextThreadEvent::ParsedSlashCommandsUpdated { removed, updated } => {
                 self.editor.update(cx, |editor, cx| {
                     let buffer = editor.buffer().read(cx).snapshot(cx);
                     let (&excerpt_id, _, _) = buffer.as_singleton().unwrap();
@@ -657,12 +688,12 @@ impl TextThreadEditor {
                         updated.iter().map(|command| {
                             let workspace = self.workspace.clone();
                             let confirm_command = Arc::new({
-                                let context_editor = context_editor.clone();
+                                let text_thread_editor = text_thread_editor.clone();
                                 let command = command.clone();
                                 move |window: &mut Window, cx: &mut App| {
-                                    context_editor
-                                        .update(cx, |context_editor, cx| {
-                                            context_editor.run_command(
+                                    text_thread_editor
+                                        .update(cx, |text_thread_editor, cx| {
+                                            text_thread_editor.run_command(
                                                 command.source_range.clone(),
                                                 &command.name,
                                                 &command.arguments,
@@ -712,17 +743,17 @@ impl TextThreadEditor {
                     );
                 })
             }
-            ContextEvent::InvokedSlashCommandChanged { command_id } => {
+            TextThreadEvent::InvokedSlashCommandChanged { command_id } => {
                 self.update_invoked_slash_command(*command_id, window, cx);
             }
-            ContextEvent::SlashCommandOutputSectionAdded { section } => {
+            TextThreadEvent::SlashCommandOutputSectionAdded { section } => {
                 self.insert_slash_command_output_sections([section.clone()], false, window, cx);
             }
-            ContextEvent::Operation(_) => {}
-            ContextEvent::ShowAssistError(error_message) => {
+            TextThreadEvent::Operation(_) => {}
+            TextThreadEvent::ShowAssistError(error_message) => {
                 self.last_error = Some(AssistError::Message(error_message.clone()));
             }
-            ContextEvent::ShowPaymentRequiredError => {
+            TextThreadEvent::ShowPaymentRequiredError => {
                 self.last_error = Some(AssistError::PaymentRequired);
             }
         }
@@ -735,14 +766,14 @@ impl TextThreadEditor {
         cx: &mut Context<Self>,
     ) {
         if let Some(invoked_slash_command) =
-            self.context.read(cx).invoked_slash_command(&command_id)
+            self.text_thread.read(cx).invoked_slash_command(&command_id)
             && let InvokedSlashCommandStatus::Finished = invoked_slash_command.status
         {
             let run_commands_in_ranges = invoked_slash_command.run_commands_in_ranges.clone();
             for range in run_commands_in_ranges {
-                let commands = self.context.update(cx, |context, cx| {
-                    context.reparse(cx);
-                    context
+                let commands = self.text_thread.update(cx, |text_thread, cx| {
+                    text_thread.reparse(cx);
+                    text_thread
                         .pending_commands_for_range(range.clone(), cx)
                         .to_vec()
                 });
@@ -763,7 +794,7 @@ impl TextThreadEditor {
 
         self.editor.update(cx, |editor, cx| {
             if let Some(invoked_slash_command) =
-                self.context.read(cx).invoked_slash_command(&command_id)
+                self.text_thread.read(cx).invoked_slash_command(&command_id)
             {
                 if let InvokedSlashCommandStatus::Finished = invoked_slash_command.status {
                     let buffer = editor.buffer().read(cx).snapshot(cx);
@@ -790,7 +821,7 @@ impl TextThreadEditor {
                     let buffer = editor.buffer().read(cx).snapshot(cx);
                     let (&excerpt_id, _buffer_id, _buffer_snapshot) =
                         buffer.as_singleton().unwrap();
-                    let context = self.context.downgrade();
+                    let context = self.text_thread.downgrade();
                     let range = buffer
                         .anchor_range_in_excerpt(excerpt_id, invoked_slash_command.range.clone())
                         .unwrap();
@@ -1020,7 +1051,7 @@ impl TextThreadEditor {
 
             let render_block = |message: MessageMetadata| -> RenderBlock {
                 Arc::new({
-                    let context = self.context.clone();
+                    let text_thread = self.text_thread.clone();
 
                     move |cx| {
                         let message_id = MessageId(message.timestamp);
@@ -1093,10 +1124,10 @@ impl TextThreadEditor {
                                         )
                                     })
                                     .on_click({
-                                        let context = context.clone();
+                                        let text_thread = text_thread.clone();
                                         move |_, _window, cx| {
-                                            context.update(cx, |context, cx| {
-                                                context.cycle_message_roles(
+                                            text_thread.update(cx, |text_thread, cx| {
+                                                text_thread.cycle_message_roles(
                                                     HashSet::from_iter(Some(message_id)),
                                                     cx,
                                                 )
@@ -1158,11 +1189,11 @@ impl TextThreadEditor {
                                         .icon_position(IconPosition::Start)
                                         .tooltip(Tooltip::text("View Details"))
                                         .on_click({
-                                            let context = context.clone();
+                                            let text_thread = text_thread.clone();
                                             let error = error.clone();
                                             move |_, _window, cx| {
-                                                context.update(cx, |_, cx| {
-                                                    cx.emit(ContextEvent::ShowAssistError(
+                                                text_thread.update(cx, |_, cx| {
+                                                    cx.emit(TextThreadEvent::ShowAssistError(
                                                         error.clone(),
                                                     ));
                                                 });
@@ -1205,7 +1236,7 @@ impl TextThreadEditor {
             };
             let mut new_blocks = vec![];
             let mut block_index_to_message = vec![];
-            for message in self.context.read(cx).messages(cx) {
+            for message in self.text_thread.read(cx).messages(cx) {
                 if blocks_to_remove.remove(&message.id).is_some() {
                     // This is an old message that we might modify.
                     let Some((meta, block_id)) = old_blocks.get_mut(&message.id) else {
@@ -1246,18 +1277,18 @@ impl TextThreadEditor {
     ) -> Option<(String, bool)> {
         const CODE_FENCE_DELIMITER: &str = "```";
 
-        let context_editor = context_editor_view.read(cx).editor.clone();
-        context_editor.update(cx, |context_editor, cx| {
-            let display_map = context_editor.display_snapshot(cx);
-            if context_editor
+        let text_thread_editor = context_editor_view.read(cx).editor.clone();
+        text_thread_editor.update(cx, |text_thread_editor, cx| {
+            let display_map = text_thread_editor.display_snapshot(cx);
+            if text_thread_editor
                 .selections
                 .newest::<Point>(&display_map)
                 .is_empty()
             {
-                let snapshot = context_editor.buffer().read(cx).snapshot(cx);
+                let snapshot = text_thread_editor.buffer().read(cx).snapshot(cx);
                 let (_, _, snapshot) = snapshot.as_singleton()?;
 
-                let head = context_editor
+                let head = text_thread_editor
                     .selections
                     .newest::<Point>(&display_map)
                     .head();
@@ -1277,8 +1308,8 @@ impl TextThreadEditor {
 
                 (!text.is_empty()).then_some((text, true))
             } else {
-                let selection = context_editor.selections.newest_adjusted(&display_map);
-                let buffer = context_editor.buffer().read(cx).snapshot(cx);
+                let selection = text_thread_editor.selections.newest_adjusted(&display_map);
+                let buffer = text_thread_editor.buffer().read(cx).snapshot(cx);
                 let selected_text = buffer.text_for_range(selection.range()).collect::<String>();
 
                 (!selected_text.is_empty()).then_some((selected_text, false))
@@ -1296,7 +1327,7 @@ impl TextThreadEditor {
             return;
         };
         let Some(context_editor_view) =
-            agent_panel_delegate.active_context_editor(workspace, window, cx)
+            agent_panel_delegate.active_text_thread_editor(workspace, window, cx)
         else {
             return;
         };
@@ -1324,7 +1355,7 @@ impl TextThreadEditor {
         let result = maybe!({
             let agent_panel_delegate = <dyn AgentPanelDelegate>::try_global(cx)?;
             let context_editor_view =
-                agent_panel_delegate.active_context_editor(workspace, window, cx)?;
+                agent_panel_delegate.active_text_thread_editor(workspace, window, cx)?;
             Self::get_selection_or_code_block(&context_editor_view, cx)
         });
         let Some((text, is_code_block)) = result else {
@@ -1361,7 +1392,7 @@ impl TextThreadEditor {
             return;
         };
         let Some(context_editor_view) =
-            agent_panel_delegate.active_context_editor(workspace, window, cx)
+            agent_panel_delegate.active_text_thread_editor(workspace, window, cx)
         else {
             return;
         };
@@ -1570,7 +1601,11 @@ impl TextThreadEditor {
     fn get_clipboard_contents(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> (String, CopyMetadata, Vec<text::Selection<usize>>) {
+    ) -> (
+        String,
+        CopyMetadata,
+        Vec<text::Selection<MultiBufferOffset>>,
+    ) {
         let (mut selection, creases) = self.editor.update(cx, |editor, cx| {
             let mut selection = editor
                 .selections
@@ -1622,32 +1657,32 @@ impl TextThreadEditor {
             )
         });
 
-        let context = self.context.read(cx);
+        let text_thread = self.text_thread.read(cx);
 
         let mut text = String::new();
 
         // If selection is empty, we want to copy the entire line
         if selection.range().is_empty() {
-            let snapshot = context.buffer().read(cx).snapshot();
+            let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
             let point = snapshot.offset_to_point(selection.range().start);
             selection.start = snapshot.point_to_offset(Point::new(point.row, 0));
             selection.end = snapshot
                 .point_to_offset(cmp::min(Point::new(point.row + 1, 0), snapshot.max_point()));
-            for chunk in context.buffer().read(cx).text_for_range(selection.range()) {
+            for chunk in snapshot.text_for_range(selection.range()) {
                 text.push_str(chunk);
             }
         } else {
-            for message in context.messages(cx) {
-                if message.offset_range.start >= selection.range().end {
+            for message in text_thread.messages(cx) {
+                if message.offset_range.start >= selection.range().end.0 {
                     break;
-                } else if message.offset_range.end >= selection.range().start {
-                    let range = cmp::max(message.offset_range.start, selection.range().start)
-                        ..cmp::min(message.offset_range.end, selection.range().end);
+                } else if message.offset_range.end >= selection.range().start.0 {
+                    let range = cmp::max(message.offset_range.start, selection.range().start.0)
+                        ..cmp::min(message.offset_range.end, selection.range().end.0);
                     if !range.is_empty() {
-                        for chunk in context.buffer().read(cx).text_for_range(range) {
+                        for chunk in text_thread.buffer().read(cx).text_for_range(range) {
                             text.push_str(chunk);
                         }
-                        if message.offset_range.end < selection.range().end {
+                        if message.offset_range.end < selection.range().end.0 {
                             text.push('\n');
                         }
                     }
@@ -1663,9 +1698,101 @@ impl TextThreadEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let editor_clipboard_selections = cx
+            .read_from_clipboard()
+            .and_then(|item| item.entries().first().cloned())
+            .and_then(|entry| match entry {
+                ClipboardEntry::String(text) => {
+                    text.metadata_json::<Vec<editor::ClipboardSelection>>()
+                }
+                _ => None,
+            });
+
+        let has_file_context = editor_clipboard_selections
+            .as_ref()
+            .is_some_and(|selections| {
+                selections
+                    .iter()
+                    .any(|sel| sel.file_path.is_some() && sel.line_range.is_some())
+            });
+
+        if has_file_context {
+            if let Some(clipboard_item) = cx.read_from_clipboard() {
+                if let Some(ClipboardEntry::String(clipboard_text)) =
+                    clipboard_item.entries().first()
+                {
+                    if let Some(selections) = editor_clipboard_selections {
+                        cx.stop_propagation();
+
+                        let text = clipboard_text.text();
+                        self.editor.update(cx, |editor, cx| {
+                            let mut current_offset = 0;
+                            let weak_editor = cx.entity().downgrade();
+
+                            for selection in selections {
+                                if let (Some(file_path), Some(line_range)) =
+                                    (selection.file_path, selection.line_range)
+                                {
+                                    let selected_text =
+                                        &text[current_offset..current_offset + selection.len];
+                                    let fence = assistant_slash_commands::codeblock_fence_for_path(
+                                        file_path.to_str(),
+                                        Some(line_range.clone()),
+                                    );
+                                    let formatted_text = format!("{fence}{selected_text}\n```");
+
+                                    let insert_point = editor
+                                        .selections
+                                        .newest::<Point>(&editor.display_snapshot(cx))
+                                        .head();
+                                    let start_row = MultiBufferRow(insert_point.row);
+
+                                    editor.insert(&formatted_text, window, cx);
+
+                                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                                    let anchor_before = snapshot.anchor_after(insert_point);
+                                    let anchor_after = editor
+                                        .selections
+                                        .newest_anchor()
+                                        .head()
+                                        .bias_left(&snapshot);
+
+                                    editor.insert("\n", window, cx);
+
+                                    let crease_text = acp_thread::selection_name(
+                                        Some(file_path.as_ref()),
+                                        &line_range,
+                                    );
+
+                                    let fold_placeholder = quote_selection_fold_placeholder(
+                                        crease_text,
+                                        weak_editor.clone(),
+                                    );
+                                    let crease = Crease::inline(
+                                        anchor_before..anchor_after,
+                                        fold_placeholder,
+                                        render_quote_selection_output_toggle,
+                                        |_, _, _, _| Empty.into_any(),
+                                    );
+                                    editor.insert_creases(vec![crease], cx);
+                                    editor.fold_at(start_row, window, cx);
+
+                                    current_offset += selection.len;
+                                    if !selection.is_entire_line && current_offset < text.len() {
+                                        current_offset += 1;
+                                    }
+                                }
+                            }
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+
         cx.stop_propagation();
 
-        let images = if let Some(item) = cx.read_from_clipboard() {
+        let mut images = if let Some(item) = cx.read_from_clipboard() {
             item.into_entries()
                 .filter_map(|entry| {
                     if let ClipboardEntry::Image(image) = entry {
@@ -1678,6 +1805,40 @@ impl TextThreadEditor {
         } else {
             Vec::new()
         };
+
+        if let Some(paths) = cx.read_from_clipboard() {
+            for path in paths
+                .into_entries()
+                .filter_map(|entry| {
+                    if let ClipboardEntry::ExternalPaths(paths) = entry {
+                        Some(paths.paths().to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+            {
+                let Ok(content) = std::fs::read(path) else {
+                    continue;
+                };
+                let Ok(format) = image::guess_format(&content) else {
+                    continue;
+                };
+                images.push(gpui::Image::from_bytes(
+                    match format {
+                        image::ImageFormat::Png => gpui::ImageFormat::Png,
+                        image::ImageFormat::Jpeg => gpui::ImageFormat::Jpeg,
+                        image::ImageFormat::WebP => gpui::ImageFormat::Webp,
+                        image::ImageFormat::Gif => gpui::ImageFormat::Gif,
+                        image::ImageFormat::Bmp => gpui::ImageFormat::Bmp,
+                        image::ImageFormat::Tiff => gpui::ImageFormat::Tiff,
+                        image::ImageFormat::Ico => gpui::ImageFormat::Ico,
+                        _ => continue,
+                    },
+                    content,
+                ));
+            }
+        }
 
         let metadata = if let Some(item) = cx.read_from_clipboard() {
             item.entries().first().and_then(|entry| {
@@ -1695,7 +1856,7 @@ impl TextThreadEditor {
             self.editor.update(cx, |editor, cx| {
                 let paste_position = editor
                     .selections
-                    .newest::<usize>(&editor.display_snapshot(cx))
+                    .newest::<MultiBufferOffset>(&editor.display_snapshot(cx))
                     .head();
                 editor.paste(action, window, cx);
 
@@ -1743,19 +1904,22 @@ impl TextThreadEditor {
                 editor.transact(window, cx, |editor, _window, cx| {
                     let edits = editor
                         .selections
-                        .all::<usize>(&editor.display_snapshot(cx))
+                        .all::<MultiBufferOffset>(&editor.display_snapshot(cx))
                         .into_iter()
                         .map(|selection| (selection.start..selection.end, "\n"));
                     editor.edit(edits, cx);
 
                     let snapshot = editor.buffer().read(cx).snapshot(cx);
-                    for selection in editor.selections.all::<usize>(&editor.display_snapshot(cx)) {
+                    for selection in editor
+                        .selections
+                        .all::<MultiBufferOffset>(&editor.display_snapshot(cx))
+                    {
                         image_positions.push(snapshot.anchor_before(selection.end));
                     }
                 });
             });
 
-            self.context.update(cx, |context, cx| {
+            self.text_thread.update(cx, |text_thread, cx| {
                 for image in images {
                     let Some(render_image) = image.to_image_data(cx.svg_renderer()).log_err()
                     else {
@@ -1765,7 +1929,7 @@ impl TextThreadEditor {
                     let image_task = LanguageModelImage::from_image(Arc::new(image), cx).shared();
 
                     for image_position in image_positions.iter() {
-                        context.insert_content(
+                        text_thread.insert_content(
                             Content::Image {
                                 anchor: image_position.text_anchor,
                                 image_id,
@@ -1786,7 +1950,7 @@ impl TextThreadEditor {
             let excerpt_id = *buffer.as_singleton().unwrap().0;
             let old_blocks = std::mem::take(&mut self.image_blocks);
             let new_blocks = self
-                .context
+                .text_thread
                 .read(cx)
                 .contents(cx)
                 .map(
@@ -1834,36 +1998,36 @@ impl TextThreadEditor {
     }
 
     fn split(&mut self, _: &Split, _window: &mut Window, cx: &mut Context<Self>) {
-        self.context.update(cx, |context, cx| {
+        self.text_thread.update(cx, |text_thread, cx| {
             let selections = self.editor.read(cx).selections.disjoint_anchors_arc();
             for selection in selections.as_ref() {
                 let buffer = self.editor.read(cx).buffer().read(cx).snapshot(cx);
                 let range = selection
                     .map(|endpoint| endpoint.to_offset(&buffer))
                     .range();
-                context.split_message(range, cx);
+                text_thread.split_message(range.start.0..range.end.0, cx);
             }
         });
     }
 
     fn save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
-        self.context.update(cx, |context, cx| {
-            context.save(Some(Duration::from_millis(500)), self.fs.clone(), cx)
+        self.text_thread.update(cx, |text_thread, cx| {
+            text_thread.save(Some(Duration::from_millis(500)), self.fs.clone(), cx)
         });
     }
 
     pub fn title(&self, cx: &App) -> SharedString {
-        self.context.read(cx).summary().or_default()
+        self.text_thread.read(cx).summary().or_default()
     }
 
     pub fn regenerate_summary(&mut self, cx: &mut Context<Self>) {
-        self.context
-            .update(cx, |context, cx| context.summarize(true, cx));
+        self.text_thread
+            .update(cx, |text_thread, cx| text_thread.summarize(true, cx));
     }
 
     fn render_remaining_tokens(&self, cx: &App) -> Option<impl IntoElement + use<>> {
         let (token_count_color, token_count, max_token_count, tooltip) =
-            match token_state(&self.context, cx)? {
+            match token_state(&self.text_thread, cx)? {
                 TokenState::NoTokensLeft {
                     max_token_count,
                     token_count,
@@ -1911,7 +2075,7 @@ impl TextThreadEditor {
     fn render_send_button(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx);
 
-        let (style, tooltip) = match token_state(&self.context, cx) {
+        let (style, tooltip) = match token_state(&self.text_thread, cx) {
             Some(TokenState::NoTokensLeft { .. }) => (
                 ButtonStyle::Tinted(TintColor::Error),
                 Some(Tooltip::text("Token limit reached")(window, cx)),
@@ -1986,7 +2150,7 @@ impl TextThreadEditor {
     }
 
     fn render_burn_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let context = self.context().read(cx);
+        let text_thread = self.text_thread().read(cx);
         let active_model = LanguageModelRegistry::read_global(cx)
             .default_model()
             .map(|default| default.model)?;
@@ -1994,7 +2158,7 @@ impl TextThreadEditor {
             return None;
         }
 
-        let active_completion_mode = context.completion_mode();
+        let active_completion_mode = text_thread.completion_mode();
         let burn_mode_enabled = active_completion_mode == CompletionMode::Burn;
         let icon = if burn_mode_enabled {
             IconName::ZedBurnModeOn
@@ -2009,8 +2173,8 @@ impl TextThreadEditor {
                 .toggle_state(burn_mode_enabled)
                 .selected_icon_color(Color::Error)
                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.context().update(cx, |context, _cx| {
-                        context.set_completion_mode(match active_completion_mode {
+                    this.text_thread().update(cx, |text_thread, _cx| {
+                        text_thread.set_completion_mode(match active_completion_mode {
                             CompletionMode::Burn => CompletionMode::Normal,
                             CompletionMode::Normal => CompletionMode::Burn,
                         });
@@ -2047,11 +2211,52 @@ impl TextThreadEditor {
         };
 
         let focus_handle = self.editor().focus_handle(cx);
+
         let (color, icon) = if self.language_model_selector_menu_handle.is_deployed() {
             (Color::Accent, IconName::ChevronUp)
         } else {
             (Color::Muted, IconName::ChevronDown)
         };
+
+        let tooltip = Tooltip::element({
+            move |_, cx| {
+                let focus_handle = focus_handle.clone();
+                let should_show_cycle_row = !AgentSettings::get_global(cx)
+                    .favorite_model_ids()
+                    .is_empty();
+
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_between()
+                            .child(Label::new("Change Model"))
+                            .child(KeyBinding::for_action_in(
+                                &ToggleModelSelector,
+                                &focus_handle,
+                                cx,
+                            )),
+                    )
+                    .when(should_show_cycle_row, |this| {
+                        this.child(
+                            h_flex()
+                                .pt_1()
+                                .gap_2()
+                                .border_t_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .justify_between()
+                                .child(Label::new("Cycle Favorited Models"))
+                                .child(KeyBinding::for_action_in(
+                                    &CycleFavoriteModels,
+                                    &focus_handle,
+                                    cx,
+                                )),
+                        )
+                    })
+                    .into_any()
+            }
+        });
 
         PickerPopoverMenu::new(
             self.language_model_selector.clone(),
@@ -2069,9 +2274,7 @@ impl TextThreadEditor {
                         )
                         .child(Icon::new(icon).color(color).size(IconSize::XSmall)),
                 ),
-            move |_window, cx| {
-                Tooltip::for_action_in("Change Model", &ToggleModelSelector, &focus_handle, cx)
-            },
+            tooltip,
             gpui::Corner::BottomRight,
             cx,
         )
@@ -2431,6 +2634,11 @@ impl Render for TextThreadEditor {
             .on_action(move |_: &ToggleModelSelector, window, cx| {
                 language_model_selector.toggle(window, cx);
             })
+            .on_action(cx.listener(|this, _: &CycleFavoriteModels, window, cx| {
+                this.language_model_selector.update(cx, |selector, cx| {
+                    selector.delegate.cycle_favorite_models(window, cx);
+                });
+            }))
             .size_full()
             .child(
                 div()
@@ -2500,7 +2708,11 @@ impl Item for TextThreadEditor {
         Some(self.title(cx).to_string().into())
     }
 
-    fn as_searchable(&self, handle: &Entity<Self>) -> Option<Box<dyn SearchableItemHandle>> {
+    fn as_searchable(
+        &self,
+        handle: &Entity<Self>,
+        _: &App,
+    ) -> Option<Box<dyn SearchableItemHandle>> {
         Some(Box::new(handle.clone()))
     }
 
@@ -2535,11 +2747,11 @@ impl Item for TextThreadEditor {
         type_id: TypeId,
         self_handle: &'a Entity<Self>,
         _: &'a App,
-    ) -> Option<AnyView> {
+    ) -> Option<gpui::AnyEntity> {
         if type_id == TypeId::of::<Self>() {
-            Some(self_handle.to_any())
+            Some(self_handle.clone().into())
         } else if type_id == TypeId::of::<Editor>() {
-            Some(self.editor.to_any())
+            Some(self.editor.clone().into())
         } else {
             None
         }
@@ -2562,11 +2774,13 @@ impl SearchableItem for TextThreadEditor {
     fn update_matches(
         &mut self,
         matches: &[Self::Match],
+        active_match_index: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.editor
-            .update(cx, |editor, cx| editor.update_matches(matches, window, cx));
+        self.editor.update(cx, |editor, cx| {
+            editor.update_matches(matches, active_match_index, window, cx)
+        });
     }
 
     fn query_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) -> String {
@@ -2637,10 +2851,10 @@ impl FollowableItem for TextThreadEditor {
     }
 
     fn to_state_proto(&self, window: &Window, cx: &App) -> Option<proto::view::Variant> {
-        let context = self.context.read(cx);
+        let text_thread = self.text_thread.read(cx);
         Some(proto::view::Variant::ContextEditor(
             proto::view::ContextEditor {
-                context_id: context.id().to_proto(),
+                context_id: text_thread.id().to_proto(),
                 editor: if let Some(proto::view::Variant::Editor(proto)) =
                     self.editor.read(cx).to_state_proto(window, cx)
                 {
@@ -2666,22 +2880,22 @@ impl FollowableItem for TextThreadEditor {
             unreachable!()
         };
 
-        let context_id = ContextId::from_proto(state.context_id);
+        let text_thread_id = TextThreadId::from_proto(state.context_id);
         let editor_state = state.editor?;
 
         let project = workspace.read(cx).project().clone();
         let agent_panel_delegate = <dyn AgentPanelDelegate>::try_global(cx)?;
 
-        let context_editor_task = workspace.update(cx, |workspace, cx| {
-            agent_panel_delegate.open_remote_context(workspace, context_id, window, cx)
+        let text_thread_editor_task = workspace.update(cx, |workspace, cx| {
+            agent_panel_delegate.open_remote_text_thread(workspace, text_thread_id, window, cx)
         });
 
         Some(window.spawn(cx, async move |cx| {
-            let context_editor = context_editor_task.await?;
-            context_editor
-                .update_in(cx, |context_editor, window, cx| {
-                    context_editor.remote_id = Some(id);
-                    context_editor.editor.update(cx, |editor, cx| {
+            let text_thread_editor = text_thread_editor_task.await?;
+            text_thread_editor
+                .update_in(cx, |text_thread_editor, window, cx| {
+                    text_thread_editor.remote_id = Some(id);
+                    text_thread_editor.editor.update(cx, |editor, cx| {
                         editor.apply_update_proto(
                             &project,
                             proto::update_view::Variant::Editor(proto::update_view::Editor {
@@ -2698,7 +2912,7 @@ impl FollowableItem for TextThreadEditor {
                     })
                 })?
                 .await?;
-            Ok(context_editor)
+            Ok(text_thread_editor)
         }))
     }
 
@@ -2745,7 +2959,7 @@ impl FollowableItem for TextThreadEditor {
     }
 
     fn dedup(&self, existing: &Self, _window: &Window, cx: &App) -> Option<item::Dedup> {
-        if existing.context.read(cx).id() == self.context.read(cx).id() {
+        if existing.text_thread.read(cx).id() == self.text_thread.read(cx).id() {
             Some(item::Dedup::KeepExisting)
         } else {
             None
@@ -2757,17 +2971,17 @@ enum PendingSlashCommand {}
 
 fn invoked_slash_command_fold_placeholder(
     command_id: InvokedSlashCommandId,
-    context: WeakEntity<AssistantContext>,
+    text_thread: WeakEntity<TextThread>,
 ) -> FoldPlaceholder {
     FoldPlaceholder {
         constrain_width: false,
         merge_adjacent: false,
         render: Arc::new(move |fold_id, _, cx| {
-            let Some(context) = context.upgrade() else {
+            let Some(text_thread) = text_thread.upgrade() else {
                 return Empty.into_any();
             };
 
-            let Some(command) = context.read(cx).invoked_slash_command(&command_id) else {
+            let Some(command) = text_thread.read(cx).invoked_slash_command(&command_id) else {
                 return Empty.into_any();
             };
 
@@ -2808,14 +3022,15 @@ enum TokenState {
     },
 }
 
-fn token_state(context: &Entity<AssistantContext>, cx: &App) -> Option<TokenState> {
+fn token_state(text_thread: &Entity<TextThread>, cx: &App) -> Option<TokenState> {
     const WARNING_TOKEN_THRESHOLD: f32 = 0.8;
 
     let model = LanguageModelRegistry::read_global(cx)
         .default_model()?
         .model;
-    let token_count = context.read(cx).token_count()?;
-    let max_token_count = model.max_token_count_for_mode(context.read(cx).completion_mode().into());
+    let token_count = text_thread.read(cx).token_count()?;
+    let max_token_count =
+        model.max_token_count_for_mode(text_thread.read(cx).completion_mode().into());
     let token_state = if max_token_count.saturating_sub(token_count) == 0 {
         TokenState::NoTokensLeft {
             max_token_count,
@@ -2914,7 +3129,7 @@ pub fn make_lsp_adapter_delegate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use editor::SelectionEffects;
+    use editor::{MultiBufferOffset, SelectionEffects};
     use fs::FakeFs;
     use gpui::{App, TestAppContext, VisualTestContext};
     use indoc::indoc;
@@ -2927,7 +3142,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_copy_paste_whole_message(cx: &mut TestAppContext) {
-        let (context, context_editor, mut cx) = setup_context_editor_text(vec![
+        let (context, text_thread_editor, mut cx) = setup_text_thread_editor_text(vec![
             (Role::User, "What is the Zed editor?"),
             (
                 Role::Assistant,
@@ -2937,8 +3152,8 @@ mod tests {
         ],cx).await;
 
         // Select & Copy whole user message
-        assert_copy_paste_context_editor(
-            &context_editor,
+        assert_copy_paste_text_thread_editor(
+            &text_thread_editor,
             message_range(&context, 0, &mut cx),
             indoc! {"
                 What is the Zed editor?
@@ -2949,8 +3164,8 @@ mod tests {
         );
 
         // Select & Copy whole assistant message
-        assert_copy_paste_context_editor(
-            &context_editor,
+        assert_copy_paste_text_thread_editor(
+            &text_thread_editor,
             message_range(&context, 1, &mut cx),
             indoc! {"
                 What is the Zed editor?
@@ -2964,7 +3179,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_copy_paste_no_selection(cx: &mut TestAppContext) {
-        let (context, context_editor, mut cx) = setup_context_editor_text(
+        let (context, text_thread_editor, mut cx) = setup_text_thread_editor_text(
             vec![
                 (Role::User, "user1"),
                 (Role::Assistant, "assistant1"),
@@ -2977,8 +3192,8 @@ mod tests {
 
         // Copy and paste first assistant message
         let message_2_range = message_range(&context, 1, &mut cx);
-        assert_copy_paste_context_editor(
-            &context_editor,
+        assert_copy_paste_text_thread_editor(
+            &text_thread_editor,
             message_2_range.start..message_2_range.start,
             indoc! {"
                 user1
@@ -2991,8 +3206,8 @@ mod tests {
 
         // Copy and cut second assistant message
         let message_3_range = message_range(&context, 2, &mut cx);
-        assert_copy_paste_context_editor(
-            &context_editor,
+        assert_copy_paste_text_thread_editor(
+            &text_thread_editor,
             message_3_range.start..message_3_range.start,
             indoc! {"
                 user1
@@ -3079,29 +3294,29 @@ mod tests {
         }
     }
 
-    async fn setup_context_editor_text(
+    async fn setup_text_thread_editor_text(
         messages: Vec<(Role, &str)>,
         cx: &mut TestAppContext,
     ) -> (
-        Entity<AssistantContext>,
+        Entity<TextThread>,
         Entity<TextThreadEditor>,
         VisualTestContext,
     ) {
         cx.update(init_test);
 
         let fs = FakeFs::new(cx.executor());
-        let context = create_context_with_messages(messages, cx);
+        let text_thread = create_text_thread_with_messages(messages, cx);
 
         let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
         let window = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let workspace = window.root(cx).unwrap();
         let mut cx = VisualTestContext::from_window(*window, cx);
 
-        let context_editor = window
+        let text_thread_editor = window
             .update(&mut cx, |_, window, cx| {
                 cx.new(|cx| {
-                    TextThreadEditor::for_context(
-                        context.clone(),
+                    TextThreadEditor::for_text_thread(
+                        text_thread.clone(),
                         fs,
                         workspace.downgrade(),
                         project,
@@ -3113,93 +3328,93 @@ mod tests {
             })
             .unwrap();
 
-        (context, context_editor, cx)
+        (text_thread, text_thread_editor, cx)
     }
 
     fn message_range(
-        context: &Entity<AssistantContext>,
+        text_thread: &Entity<TextThread>,
         message_ix: usize,
         cx: &mut TestAppContext,
-    ) -> Range<usize> {
-        context.update(cx, |context, cx| {
-            context
+    ) -> Range<MultiBufferOffset> {
+        let range = text_thread.update(cx, |text_thread, cx| {
+            text_thread
                 .messages(cx)
                 .nth(message_ix)
                 .unwrap()
                 .anchor_range
-                .to_offset(&context.buffer().read(cx).snapshot())
-        })
+                .to_offset(&text_thread.buffer().read(cx).snapshot())
+        });
+        MultiBufferOffset(range.start)..MultiBufferOffset(range.end)
     }
 
-    fn assert_copy_paste_context_editor<T: editor::ToOffset>(
-        context_editor: &Entity<TextThreadEditor>,
+    fn assert_copy_paste_text_thread_editor<T: editor::ToOffset>(
+        text_thread_editor: &Entity<TextThreadEditor>,
         range: Range<T>,
         expected_text: &str,
         cx: &mut VisualTestContext,
     ) {
-        context_editor.update_in(cx, |context_editor, window, cx| {
-            context_editor.editor.update(cx, |editor, cx| {
+        text_thread_editor.update_in(cx, |text_thread_editor, window, cx| {
+            text_thread_editor.editor.update(cx, |editor, cx| {
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
                     s.select_ranges([range])
                 });
             });
 
-            context_editor.copy(&Default::default(), window, cx);
+            text_thread_editor.copy(&Default::default(), window, cx);
 
-            context_editor.editor.update(cx, |editor, cx| {
+            text_thread_editor.editor.update(cx, |editor, cx| {
                 editor.move_to_end(&Default::default(), window, cx);
             });
 
-            context_editor.paste(&Default::default(), window, cx);
+            text_thread_editor.paste(&Default::default(), window, cx);
 
-            context_editor.editor.update(cx, |editor, cx| {
+            text_thread_editor.editor.update(cx, |editor, cx| {
                 assert_eq!(editor.text(cx), expected_text);
             });
         });
     }
 
-    fn create_context_with_messages(
+    fn create_text_thread_with_messages(
         mut messages: Vec<(Role, &str)>,
         cx: &mut TestAppContext,
-    ) -> Entity<AssistantContext> {
+    ) -> Entity<TextThread> {
         let registry = Arc::new(LanguageRegistry::test(cx.executor()));
         let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
         cx.new(|cx| {
-            let mut context = AssistantContext::local(
+            let mut text_thread = TextThread::local(
                 registry,
-                None,
                 None,
                 prompt_builder.clone(),
                 Arc::new(SlashCommandWorkingSet::default()),
                 cx,
             );
-            let mut message_1 = context.messages(cx).next().unwrap();
+            let mut message_1 = text_thread.messages(cx).next().unwrap();
             let (role, text) = messages.remove(0);
 
             loop {
                 if role == message_1.role {
-                    context.buffer().update(cx, |buffer, cx| {
+                    text_thread.buffer().update(cx, |buffer, cx| {
                         buffer.edit([(message_1.offset_range, text)], None, cx);
                     });
                     break;
                 }
                 let mut ids = HashSet::default();
                 ids.insert(message_1.id);
-                context.cycle_message_roles(ids, cx);
-                message_1 = context.messages(cx).next().unwrap();
+                text_thread.cycle_message_roles(ids, cx);
+                message_1 = text_thread.messages(cx).next().unwrap();
             }
 
             let mut last_message_id = message_1.id;
             for (role, text) in messages {
-                context.insert_message_after(last_message_id, role, MessageStatus::Done, cx);
-                let message = context.messages(cx).last().unwrap();
+                text_thread.insert_message_after(last_message_id, role, MessageStatus::Done, cx);
+                let message = text_thread.messages(cx).last().unwrap();
                 last_message_id = message.id;
-                context.buffer().update(cx, |buffer, cx| {
+                text_thread.buffer().update(cx, |buffer, cx| {
                     buffer.edit([(message.offset_range, text)], None, cx);
                 })
             }
 
-            context
+            text_thread
         })
     }
 
@@ -3208,11 +3423,7 @@ mod tests {
         prompt_store::init(cx);
         LanguageModelRegistry::test(cx);
         cx.set_global(settings_store);
-        language::init(cx);
-        agent_settings::init(cx);
-        Project::init_settings(cx);
+
         theme::init(theme::LoadThemes::JustBase, cx);
-        workspace::init_settings(cx);
-        editor::init_settings(cx);
     }
 }

@@ -1,4 +1,4 @@
-# Configuring supported languages
+# Configuring Supported Languages
 
 Zed offers powerful customization options for each programming language it supports. This guide will walk you through the various ways you can tailor your coding experience to your preferences and project requirements.
 
@@ -58,6 +58,7 @@ You can customize a wide range of settings for each language, including:
 - [`soft_wrap`](./configuring-zed.md#soft-wrap): How to wrap long lines of code
 - [`show_completions_on_input`](./configuring-zed.md#show-completions-on-input): Whether or not to show completions as you type
 - [`show_completion_documentation`](./configuring-zed.md#show-completion-documentation): Whether to display inline and alongside documentation for items in the completions menu
+- [`colorize_brackets`](./configuring-zed.md#colorize-brackets): Whether to use tree-sitter bracket queries to detect and colorize the brackets in the editor (also known as "rainbow brackets")
 
 These settings allow you to maintain specific coding styles across different languages and projects.
 
@@ -122,7 +123,7 @@ You can specify your preference using the `language_servers` setting:
 ```json [settings]
   "languages": {
     "PHP": {
-      "language_servers": ["intelephense", "!phpactor", "..."]
+      "language_servers": ["intelephense", "!phpactor", "!phptools", "..."]
     }
   }
 ```
@@ -364,18 +365,20 @@ Zed offers customization options for syntax highlighting and themes, allowing yo
 
 ### Customizing Syntax Highlighting
 
-Zed uses Tree-sitter grammars for syntax highlighting. Override the default highlighting using the `experimental.theme_overrides` setting.
+Zed uses Tree-sitter grammars for syntax highlighting. Override the default highlighting using the `theme_overrides` setting.
 
 This example makes comments italic and changes the color of strings:
 
 ```json [settings]
-"experimental.theme_overrides": {
-  "syntax": {
-    "comment": {
-      "font_style": "italic"
-    },
-    "string": {
-      "color": "#00AA00"
+"theme_overrides": {
+  "One Dark": {
+    "syntax": {
+      "comment": {
+        "font_style": "italic"
+      },
+      "string": {
+        "color": "#00AA00"
+      }
     }
   }
 }

@@ -3,7 +3,8 @@
 JavaScript support is available natively in Zed.
 
 - Tree-sitter: [tree-sitter/tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript)
-- Language Server: [typescript-language-server/typescript-language-server](https://github.com/typescript-language-server/typescript-language-server)
+- Language Server: [yioneko/vtsls](https://github.com/yioneko/vtsls)
+- Alternate Language Server: [typescript-language-server/typescript-language-server](https://github.com/typescript-language-server/typescript-language-server)
 - Debug Adapter: [vscode-js-debug](https://github.com/microsoft/vscode-js-debug)
 
 ## Code formatting
@@ -34,7 +35,7 @@ For example, if you have Prettier installed and on your `PATH`, you can use it t
 
 Zed supports JSX syntax highlighting out of the box.
 
-In JSX strings, the [`tailwindcss-language-server`](./tailwindcss.md) is used provide autocompletion for Tailwind CSS classes.
+In JSX strings, the [`tailwindcss-language-server`](./tailwindcss.md) is used to provide autocompletion for Tailwind CSS classes.
 
 ## JSDoc
 
@@ -92,6 +93,7 @@ the formatter:
 {
   "languages": {
     "JavaScript": {
+      "formatter": [],
       "code_actions_on_format": {
         "source.fixAll.eslint": true
       }

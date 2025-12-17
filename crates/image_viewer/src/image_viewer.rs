@@ -174,6 +174,10 @@ impl Item for ImageView {
         }])
     }
 
+    fn can_split(&self) -> bool {
+        true
+    }
+
     fn clone_on_split(
         &self,
         _workspace_id: Option<WorkspaceId>,
@@ -408,7 +412,6 @@ impl ProjectItem for ImageView {
 }
 
 pub fn init(cx: &mut App) {
-    ImageViewerSettings::register(cx);
     workspace::register_project_item::<ImageView>(cx);
     workspace::register_serializable_item::<ImageView>(cx);
 }

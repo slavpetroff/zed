@@ -7,7 +7,7 @@ use language::{Buffer, BufferEvent, BufferRow, Capability};
 use multi_buffer::{ExcerptRange, MultiBuffer};
 use project::{InvalidationStrategy, Project, lsp_store::CacheInlayHints};
 use smol::stream::StreamExt;
-use std::{any::TypeId, ops::Range, rc::Rc, time::Duration};
+use std::{any::TypeId, ops::Range, rc::Rc, sync::Arc, time::Duration};
 use text::{BufferId, ToOffset};
 use ui::{ButtonLike, KeyBinding, prelude::*};
 use workspace::{
@@ -103,13 +103,21 @@ impl ProposedChangesEditor {
                             buffers_to_diff
                                 .drain()
                                 .filter_map(|buffer| {
-                                    let buffer = buffer.read(cx);
-                                    let base_buffer = buffer.base_buffer()?;
-                                    let buffer = buffer.text_snapshot();
+                                    let buffer_ref = buffer.read(cx);
+                                    let base_buffer = buffer_ref.base_buffer()?;
+                                    let base_text = base_buffer.read(cx).text();
+                                    let language = buffer_ref.language().cloned();
+                                    let buffer_snapshot = buffer_ref.text_snapshot();
                                     let diff =
-                                        this.multibuffer.read(cx).diff_for(buffer.remote_id())?;
+                                        this.multibuffer.read(cx).diff_for(buffer_snapshot.remote_id())?;
                                     Some(diff.update(cx, |diff, cx| {
-                                        diff.set_base_text_buffer(base_buffer.clone(), buffer, cx)
+                                        diff.set_base_text(
+                                            Some(Arc::new(base_text)),
+                                            language,
+                                            None,
+                                            buffer_snapshot,
+                                            cx,
+                                        )
                                     }))
                                 })
                                 .collect::<Vec<_>>()
@@ -183,11 +191,16 @@ impl ProposedChangesEditor {
                 buffer_entries.push(entry);
             } else {
                 branch_buffer = location.buffer.update(cx, |buffer, cx| buffer.branch(cx));
+                let base_text = location.buffer.read(cx).text();
+                let language = branch_buffer.read(cx).language().cloned();
+                let buffer_snapshot = branch_buffer.read(cx).text_snapshot();
                 new_diffs.push(cx.new(|cx| {
                     let mut diff = BufferDiff::new(&branch_buffer.read(cx).snapshot(), cx);
-                    let _ = diff.set_base_text_buffer(
-                        location.buffer.clone(),
-                        branch_buffer.read(cx).text_snapshot(),
+                    let _ = diff.set_base_text(
+                        Some(Arc::new(base_text)),
+                        language,
+                        None,
+                        buffer_snapshot,
                         cx,
                     );
                     diff
@@ -280,7 +293,7 @@ impl Item for ProposedChangesEditor {
         self.title.clone()
     }
 
-    fn as_searchable(&self, _: &Entity<Self>) -> Option<Box<dyn SearchableItemHandle>> {
+    fn as_searchable(&self, _: &Entity<Self>, _: &App) -> Option<Box<dyn SearchableItemHandle>> {
         Some(Box::new(self.editor.clone()))
     }
 
@@ -289,11 +302,11 @@ impl Item for ProposedChangesEditor {
         type_id: TypeId,
         self_handle: &'a Entity<Self>,
         _: &'a App,
-    ) -> Option<gpui::AnyView> {
+    ) -> Option<gpui::AnyEntity> {
         if type_id == TypeId::of::<Self>() {
-            Some(self_handle.to_any())
+            Some(self_handle.clone().into_any())
         } else if type_id == TypeId::of::<Editor>() {
-            Some(self.editor.to_any())
+            Some(self.editor.clone().into_any())
         } else {
             None
         }
@@ -436,11 +449,11 @@ impl SemanticsProvider for BranchBufferSemanticsProvider {
 
     fn applicable_inlay_chunks(
         &self,
-        buffer_id: BufferId,
+        buffer: &Entity<Buffer>,
         ranges: &[Range<text::Anchor>],
-        cx: &App,
+        cx: &mut App,
     ) -> Vec<Range<BufferRow>> {
-        self.0.applicable_inlay_chunks(buffer_id, ranges, cx)
+        self.0.applicable_inlay_chunks(buffer, ranges, cx)
     }
 
     fn invalidate_inlay_hints(&self, for_buffers: &HashSet<BufferId>, cx: &mut App) {

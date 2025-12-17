@@ -6,9 +6,9 @@ use strum::IntoEnumIterator;
 use theme::all_theme_colors;
 use ui::{
     AudioStatus, Avatar, AvatarAudioStatusIndicator, AvatarAvailabilityIndicator, ButtonLike,
-    Checkbox, CheckboxWithLabel, CollaboratorAvailability, ContentGroup, DecoratedIcon,
-    ElevationIndex, Facepile, IconDecoration, Indicator, KeybindingHint, Switch, TintColor,
-    Tooltip, prelude::*, utils::calculate_contrast_ratio,
+    Checkbox, CollaboratorAvailability, ContentGroup, DecoratedIcon, ElevationIndex, Facepile,
+    IconDecoration, Indicator, KeybindingHint, Switch, TintColor, Tooltip, prelude::*,
+    utils::calculate_contrast_ratio,
 };
 
 use crate::{Item, Workspace};
@@ -95,6 +95,10 @@ impl Item for ThemePreview {
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
         None
+    }
+
+    fn can_split(&self) -> bool {
+        true
     }
 
     fn clone_on_split(

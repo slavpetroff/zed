@@ -6,8 +6,10 @@ use crate::{
     register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
+use itertools::Itertools;
 use smallvec::SmallVec;
 use std::{
+    borrow::Cow,
     cell::{Cell, RefCell},
     mem,
     ops::Range,
@@ -334,12 +336,11 @@ impl TextLayout {
             .line_height
             .to_pixels(font_size.into(), window.rem_size());
 
-        let mut runs = if let Some(runs) = runs {
+        let runs = if let Some(runs) = runs {
             runs
         } else {
             vec![text_style.to_run(text.len())]
         };
-
         window.request_measured_layout(Default::default(), {
             let element_state = self.clone();
 
@@ -378,15 +379,15 @@ impl TextLayout {
                 }
 
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
-                let text = if let Some(truncate_width) = truncate_width {
+                let (text, runs) = if let Some(truncate_width) = truncate_width {
                     line_wrapper.truncate_line(
                         text.clone(),
                         truncate_width,
                         &truncation_suffix,
-                        &mut runs,
+                        &runs,
                     )
                 } else {
-                    text.clone()
+                    (text.clone(), Cow::Borrowed(&*runs))
                 };
                 let len = text.len();
 
@@ -597,14 +598,14 @@ impl TextLayout {
             .unwrap()
             .lines
             .iter()
-            .map(|s| s.text.to_string())
-            .collect::<Vec<_>>()
+            .map(|s| &s.text)
             .join("\n")
     }
 
     /// The text for this layout (with soft-wraps as newlines)
     pub fn wrapped_text(&self) -> String {
-        let mut lines = Vec::new();
+        let mut accumulator = String::new();
+
         for wrapped in self.0.borrow().as_ref().unwrap().lines.iter() {
             let mut seen = 0;
             for boundary in wrapped.layout.wrap_boundaries.iter() {
@@ -612,13 +613,16 @@ impl TextLayout {
                     [boundary.glyph_ix]
                     .index;
 
-                lines.push(wrapped.text[seen..index].to_string());
+                accumulator.push_str(&wrapped.text[seen..index]);
+                accumulator.push('\n');
                 seen = index;
             }
-            lines.push(wrapped.text[seen..].to_string());
+            accumulator.push_str(&wrapped.text[seen..]);
+            accumulator.push('\n');
         }
-
-        lines.join("\n")
+        // Remove trailing newline
+        accumulator.pop();
+        accumulator
     }
 }
 

@@ -1,8 +1,8 @@
 # Developing Extensions
 
-## Extension Capabilities
+## Extension Features
 
-Extensions can add the following capabilities to Zed:
+Extensions are able to provide the following features to Zed:
 
 - [Languages](./languages.md)
 - [Debuggers](./debugger-extensions.md)
@@ -111,9 +111,11 @@ git submodule update
 
 ## Extension License Requirements
 
-As of October 1st, 2025, extension repositories must include one of the following licenses:
+As of October 1st, 2025, extension repositories must include a license.
+The following licenses are accepted:
 
 - [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+- [BSD 3-Clause](https://opensource.org/license/bsd-3-clause)
 - [GNU GPLv3](https://www.gnu.org/licenses/gpl-3.0.en.html)
 - [MIT](https://opensource.org/license/mit)
 
@@ -163,7 +165,15 @@ To update an extension, open a PR to [the `zed-industries/extensions` repo](http
 
 In your PR do the following:
 
-1. Update the extension's submodule to the commit of the new version.
+1. Update the extension's submodule to the commit of the new version. For this, you can run
+
+```sh
+# From the root of the repository:
+git submodule update --remote extensions/your-extension-name
+```
+
+to update your extension to the latest commit available in your remote repository.
+
 2. Update the `version` field for the extension in `extensions.toml`
    - Make sure the `version` matches the one set in `extension.toml` at the particular commit.
 

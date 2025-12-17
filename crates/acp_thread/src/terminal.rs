@@ -5,10 +5,8 @@ use gpui::{App, AppContext, AsyncApp, Context, Entity, Task};
 use language::LanguageRegistry;
 use markdown::Markdown;
 use project::Project;
-use settings::{Settings as _, SettingsLocation};
 use std::{path::PathBuf, process::ExitStatus, sync::Arc, time::Instant};
 use task::Shell;
-use terminal::terminal_settings::TerminalSettings;
 use util::get_default_system_shell_preferring_bash;
 
 pub struct Terminal {
@@ -77,11 +75,9 @@ impl Terminal {
 
                     let exit_status = exit_status.map(portable_pty::ExitStatus::from);
 
-                    acp::TerminalExitStatus {
-                        exit_code: exit_status.as_ref().map(|e| e.exit_code()),
-                        signal: exit_status.and_then(|e| e.signal().map(Into::into)),
-                        meta: None,
-                    }
+                    acp::TerminalExitStatus::new()
+                        .exit_code(exit_status.as_ref().map(|e| e.exit_code()))
+                        .signal(exit_status.and_then(|e| e.signal().map(ToOwned::to_owned)))
                 })
                 .shared(),
         }
@@ -105,25 +101,19 @@ impl Terminal {
         if let Some(output) = self.output.as_ref() {
             let exit_status = output.exit_status.map(portable_pty::ExitStatus::from);
 
-            acp::TerminalOutputResponse {
-                output: output.content.clone(),
-                truncated: output.original_content_len > output.content.len(),
-                exit_status: Some(acp::TerminalExitStatus {
-                    exit_code: exit_status.as_ref().map(|e| e.exit_code()),
-                    signal: exit_status.and_then(|e| e.signal().map(Into::into)),
-                    meta: None,
-                }),
-                meta: None,
-            }
+            acp::TerminalOutputResponse::new(
+                output.content.clone(),
+                output.original_content_len > output.content.len(),
+            )
+            .exit_status(
+                acp::TerminalExitStatus::new()
+                    .exit_code(exit_status.as_ref().map(|e| e.exit_code()))
+                    .signal(exit_status.and_then(|e| e.signal().map(ToOwned::to_owned))),
+            )
         } else {
             let (current_content, original_len) = self.truncated_output(cx);
-
-            acp::TerminalOutputResponse {
-                truncated: current_content.len() < original_len,
-                output: current_content,
-                exit_status: None,
-                meta: None,
-            }
+            let truncated = current_content.len() < original_len;
+            acp::TerminalOutputResponse::new(current_content, truncated)
         }
     }
 
@@ -187,17 +177,9 @@ pub async fn create_terminal_entity(
     let mut env = if let Some(dir) = &cwd {
         project
             .update(cx, |project, cx| {
-                let worktree = project.find_worktree(dir.as_path(), cx);
-                let shell = TerminalSettings::get(
-                    worktree.as_ref().map(|(worktree, path)| SettingsLocation {
-                        worktree_id: worktree.read(cx).id(),
-                        path: &path,
-                    }),
-                    cx,
-                )
-                .shell
-                .clone();
-                project.directory_environment(&shell, dir.clone().into(), cx)
+                project.environment().update(cx, |env, cx| {
+                    env.directory_environment(dir.clone().into(), cx)
+                })
             })?
             .await
             .unwrap_or_default()
@@ -205,8 +187,10 @@ pub async fn create_terminal_entity(
         Default::default()
     };
 
-    // Disables paging for `git` and hopefully other commands
+    // Disable pagers so agent/terminal commands don't hang behind interactive UIs
     env.insert("PAGER".into(), "".into());
+    // Override user core.pager (e.g. delta) which Git prefers over PAGER
+    env.insert("GIT_PAGER".into(), "cat".into());
     env.extend(env_vars);
 
     // Use remote shell or default system shell, as appropriate
