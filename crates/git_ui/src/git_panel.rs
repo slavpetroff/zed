@@ -3371,7 +3371,8 @@ impl GitPanel {
 
         self.stash_entries = repo.cached_stash();
 
-        for entry in repo.cached_status() {
+        // TODO SP: Fix blocking main thread on many entries 
+        for entry in repo.cached_status().take(1000) {
             self.changes_count += 1;
             let is_conflict = repo.had_conflict_on_last_merge_head_change(&entry.repo_path);
             let is_new = entry.status.is_created();
