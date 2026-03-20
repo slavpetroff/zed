@@ -175,6 +175,8 @@ pub struct LanguageSettings {
     pub word_diff_enabled: bool,
     /// Whether to use tree-sitter bracket queries to detect and colorize the brackets in the editor.
     pub colorize_brackets: bool,
+    /// Whether to colorize identifiers with deterministic name-based colors using semantic tokens.
+    pub colorize_identifiers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -661,6 +663,7 @@ impl settings::Settings for AllLanguageSettings {
                 show_completions_on_input: settings.show_completions_on_input.unwrap(),
                 show_completion_documentation: settings.show_completion_documentation.unwrap(),
                 colorize_brackets: settings.colorize_brackets.unwrap(),
+                colorize_identifiers: settings.colorize_identifiers.unwrap(),
                 completions: CompletionSettings {
                     words: completions.words.unwrap(),
                     words_min_length: completions.words_min_length.unwrap() as usize,

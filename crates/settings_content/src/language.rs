@@ -640,6 +640,13 @@ pub struct LanguageSettingsContent {
     ///
     /// Default: false
     pub colorize_brackets: Option<bool>,
+    /// Whether to colorize identifiers with deterministic name-based colors.
+    /// Uses semantic token data from language servers. Same identifier name
+    /// always gets the same color. Requires `semantic_tokens` to be set to
+    /// `"combined"` or `"full"` for the language.
+    ///
+    /// Default: false
+    pub colorize_identifiers: Option<bool>,
 }
 
 /// Controls how whitespace should be displayedin the editor.

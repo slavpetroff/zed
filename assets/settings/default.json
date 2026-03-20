@@ -280,6 +280,10 @@
   // The colors that are used for different indentation levels are defined in the theme (theme key: `accents`).
   // They can be customized by using theme overrides.
   "colorize_brackets": false,
+  // Whether to colorize identifiers with deterministic name-based colors.
+  // Uses semantic token data from language servers. Same identifier name
+  // always gets the same color.
+  "colorize_identifiers": false,
   // When to show the scrollbar in the completion menu.
   // This setting can take four values:
   //

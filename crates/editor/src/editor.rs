@@ -26,6 +26,7 @@ mod git;
 mod highlight_matching_bracket;
 mod hover_links;
 pub mod hover_popover;
+pub(crate) mod identifier_colorization;
 mod indent_guides;
 mod inlays;
 pub mod items;

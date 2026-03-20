@@ -281,11 +281,25 @@ impl Editor {
                             }
                         }
 
-                        let language_name = editor
+                        let (language_name, colorize_identifiers) = editor
                             .buffer()
                             .read(cx)
                             .buffer(buffer_id)
-                            .and_then(|buf| buf.read(cx).language().map(|l| l.name()));
+                            .map(|buf| {
+                                let buf = buf.read(cx);
+                                let language_name = buf.language().map(|l| l.name());
+                                let colorize =
+                                    language_settings(language_name.clone(), buf.file(), cx)
+                                        .colorize_identifiers;
+                                (language_name, colorize)
+                            })
+                            .unwrap_or((None, false));
+
+                        let identifier_colorization = colorize_identifiers.then(|| {
+                            let appearance = cx.theme().appearance();
+                            let editor_background = cx.theme().colors().editor_background;
+                            (appearance, editor_background)
+                        });
 
                         editor.display_map.update(cx, |display_map, cx| {
                             project.read(cx).lsp_store().update(cx, |lsp_store, cx| {
@@ -305,6 +319,7 @@ impl Editor {
                                         stylizer,
                                         &multi_buffer_snapshot,
                                         &mut interner,
+                                        identifier_colorization,
                                         cx,
                                     ));
                                 }
@@ -332,6 +347,7 @@ fn buffer_into_editor_highlights<'a, 'b>(
     stylizer: &'a SemanticTokenStylizer,
     multi_buffer_snapshot: &'a multi_buffer::MultiBufferSnapshot,
     interner: &'b mut HighlightStyleInterner,
+    identifier_colorization: Option<(theme::Appearance, gpui::Hsla)>,
     cx: &'a App,
 ) -> impl Iterator<Item = SemanticTokenHighlight> + use<'a, 'b> {
     multi_buffer_snapshot
@@ -343,14 +359,43 @@ fn buffer_into_editor_highlights<'a, 'b>(
         .into_iter()
         .tuples::<(_, _)>()
         .zip(buffer_tokens)
-        .filter_map(|((multi_buffer_start, multi_buffer_end), token)| {
+        .filter_map(move |((multi_buffer_start, multi_buffer_end), token)| {
             let range = multi_buffer_start?..multi_buffer_end?;
-            let style = convert_token(
+
+            let base_style = convert_token(
                 stylizer,
                 cx.theme().syntax(),
                 token.token_type,
                 token.token_modifiers,
-            )?;
+            );
+
+            let is_colorizable = identifier_colorization.is_some()
+                && stylizer
+                    .token_type_name(token.token_type)
+                    .is_some_and(|name| {
+                        crate::identifier_colorization::is_colorizable_token_type(name)
+                    });
+
+            let style = if is_colorizable {
+                let (appearance, editor_background) = identifier_colorization?;
+                let (hash, has_data) = crate::identifier_colorization::crc8_chunks(
+                    multi_buffer_snapshot.text_for_range(range.clone()),
+                );
+                if has_data {
+                    let mut style = base_style.unwrap_or_default();
+                    style.color = Some(crate::identifier_colorization::identifier_color(
+                        hash,
+                        appearance,
+                        editor_background,
+                    ));
+                    style
+                } else {
+                    base_style?
+                }
+            } else {
+                base_style?
+            };
+
             let style = interner.intern(style);
             Some(SemanticTokenHighlight {
                 range,
