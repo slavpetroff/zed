@@ -1219,8 +1219,9 @@ impl SerializableItem for ProjectDiff {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
+        let db = persistence::ProjectDiffDb::global(cx);
         window.spawn(cx, async move |cx| {
-            let diff_base = persistence::PROJECT_DIFF_DB.get_diff_base(item_id, workspace_id)?;
+            let diff_base = db.get_diff_base(item_id, workspace_id)?;
 
             let diff = cx.update(|window, cx| {
                 let branch_diff = cx
@@ -1246,10 +1247,10 @@ impl SerializableItem for ProjectDiff {
         let workspace_id = workspace.database_id()?;
         let diff_base = self.diff_base(cx).clone();
 
+        let db = persistence::ProjectDiffDb::global(cx);
         Some(cx.background_spawn({
             async move {
-                persistence::PROJECT_DIFF_DB
-                    .save_diff_base(item_id, workspace_id, diff_base.clone())
+                db.save_diff_base(item_id, workspace_id, diff_base.clone())
                     .await
             }
         }))
@@ -1289,7 +1290,7 @@ mod persistence {
         )];
     }
 
-    db::static_connection!(PROJECT_DIFF_DB, ProjectDiffDb, [WorkspaceDb]);
+    db::static_connection!(ProjectDiffDb, [WorkspaceDb]);
 
     impl ProjectDiffDb {
         pub async fn save_diff_base(
@@ -1592,8 +1593,11 @@ fn render_send_review_to_agent_button(review_count: usize, focus_handle: &FocusH
         "send-review",
         format!("Send Review to Agent ({})", review_count),
     )
-    .icon(IconName::ZedAssistant)
-    .icon_position(IconPosition::Start)
+    .start_icon(
+        Icon::new(IconName::ZedAssistant)
+            .size(IconSize::Small)
+            .color(Color::Muted),
+    )
     .tooltip(Tooltip::for_action_title_in(
         "Send all review comments to the Agent panel",
         &SendReviewToAgent,
@@ -1686,10 +1690,11 @@ impl Render for BranchDiffToolbar {
                 let focus_handle = focus_handle.clone();
                 this.child(Divider::vertical()).child(
                     Button::new("review-diff", "Review Diff")
-                        .icon(IconName::ZedAssistant)
-                        .icon_position(IconPosition::Start)
-                        .icon_size(IconSize::Small)
-                        .icon_color(Color::Muted)
+                        .start_icon(
+                            Icon::new(IconName::ZedAssistant)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
                         .key_binding(KeyBinding::for_action_in(&ReviewDiff, &focus_handle, cx))
                         .tooltip(move |_, cx| {
                             Tooltip::with_meta_in(

@@ -18,10 +18,7 @@ use settings::Settings;
 use std::{cell::RefCell, ops::Range, rc::Rc, sync::Arc};
 use ui::{ActiveTheme, Divider, Element as _, Styled, Window, prelude::*};
 use util::{ResultExt as _, debug_panic, maybe};
-use workspace::{
-    Workspace,
-    notifications::{NotificationId, simple_message_notification::MessageNotification},
-};
+use workspace::{Workspace, notifications::simple_message_notification::MessageNotification};
 use zed_actions::agent::{
     ConflictContent, ResolveConflictedFilesWithAgent, ResolveConflictsWithAgent,
 };
@@ -453,10 +450,11 @@ fn render_conflict_buttons(
             this.child(Divider::vertical()).child(
                 Button::new("resolve-with-agent", "Resolve with Agent")
                     .label_size(LabelSize::Small)
-                    .icon(IconName::ZedAssistant)
-                    .icon_position(IconPosition::Start)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
+                    .start_icon(
+                        Icon::new(IconName::ZedAssistant)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
                     .on_click({
                         let conflict = conflict.clone();
                         move |_, window, cx| {
@@ -497,12 +495,6 @@ fn render_conflict_buttons(
             )
         })
         .into_any()
-}
-
-struct MergeConflictNotification;
-
-fn merge_conflict_notification_id() -> NotificationId {
-    NotificationId::unique::<MergeConflictNotification>()
 }
 
 fn collect_conflicted_file_paths(workspace: &Workspace, cx: &App) -> Vec<String> {
@@ -546,8 +538,12 @@ pub(crate) fn register_conflict_notification(
             return;
         }
 
+        if workspace.is_notification_suppressed(workspace::merge_conflict_notification_id()) {
+            return;
+        }
+
         let paths = collect_conflicted_file_paths(workspace, cx);
-        let notification_id = merge_conflict_notification_id();
+        let notification_id = workspace::merge_conflict_notification_id();
         let current_paths_set: HashSet<String> = paths.iter().cloned().collect();
 
         if paths.is_empty() {
