@@ -285,8 +285,7 @@ impl Editor {
                                 let buf = buf.read(cx);
                                 let language_name = buf.language().map(|l| l.name());
                                 let colorize =
-                                    language_settings(language_name.clone(), buf.file(), cx)
-                                        .colorize_identifiers;
+                                    LanguageSettings::for_buffer(buf, cx).colorize_identifiers;
                                 (language_name, colorize)
                             })
                             .unwrap_or((None, false));
