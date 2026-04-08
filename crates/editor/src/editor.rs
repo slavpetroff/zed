@@ -133,9 +133,9 @@ use language::{
     AutoindentMode, BlockCommentConfig, BracketMatch, BracketPair, Buffer, BufferRow,
     BufferSnapshot, Capability, CharClassifier, CharKind, CharScopeContext, CodeLabel, CursorShape,
     DiagnosticEntryRef, DiffOptions, EditPredictionsMode, EditPreview, HighlightedText, IndentKind,
-    IndentSize, Language, LanguageName, LanguageRegistry, LanguageScope, LocalFile, OffsetRangeExt,
-    OutlineItem, Point, Selection, SelectionGoal, TextObject, TransactionId, TreeSitterOptions,
-    WordsQuery,
+    IndentSize, Language, LanguageAwareStyling, LanguageName, LanguageRegistry, LanguageScope,
+    LocalFile, OffsetRangeExt, OutlineItem, Point, Selection, SelectionGoal, TextObject,
+    TransactionId, TreeSitterOptions, WordsQuery,
     language_settings::{
         self, AllLanguageSettings, LanguageSettings, LspInsertMode, RewrapBehavior,
         WordsCompletionMode, all_language_settings,
@@ -1266,6 +1266,7 @@ pub struct Editor {
     >,
     use_autoclose: bool,
     use_auto_surround: bool,
+    use_selection_highlight: bool,
     auto_replace_emoji_shortcode: bool,
     jsx_tag_auto_close_enabled_in_any_buffer: bool,
     show_git_blame_gutter: bool,
@@ -2469,6 +2470,7 @@ impl Editor {
             read_only: is_minimap,
             use_autoclose: true,
             use_auto_surround: true,
+            use_selection_highlight: true,
             auto_replace_emoji_shortcode: false,
             jsx_tag_auto_close_enabled_in_any_buffer: false,
             leader_id: None,
@@ -3546,6 +3548,10 @@ impl Editor {
 
     pub fn set_use_autoclose(&mut self, autoclose: bool) {
         self.use_autoclose = autoclose;
+    }
+
+    pub fn set_use_selection_highlight(&mut self, highlight: bool) {
+        self.use_selection_highlight = highlight;
     }
 
     pub fn set_use_auto_surround(&mut self, auto_surround: bool) {
@@ -7700,7 +7706,7 @@ impl Editor {
         if matches!(self.mode, EditorMode::SingleLine) {
             return None;
         }
-        if !EditorSettings::get_global(cx).selection_highlight {
+        if !self.use_selection_highlight || !EditorSettings::get_global(cx).selection_highlight {
             return None;
         }
         if self.selections.count() != 1 || self.selections.line_mode() {
@@ -11742,10 +11748,9 @@ impl Editor {
             buffer_ids.extend(snapshot.buffer_ids_for_range(selection.range()))
         }
 
-        let buffer = self.buffer().read(cx);
         let ranges = buffer_ids
             .into_iter()
-            .flat_map(|buffer_id| buffer.range_for_buffer(buffer_id, cx))
+            .flat_map(|buffer_id| snapshot.range_for_buffer(buffer_id))
             .collect::<Vec<_>>();
 
         self.restore_hunks_in_ranges(ranges, window, cx);
@@ -19149,7 +19154,13 @@ impl Editor {
                     let range = buffer.anchor_before(rename_start)..buffer.anchor_after(rename_end);
                     let mut old_highlight_id = None;
                     let old_name: Arc<str> = buffer
-                        .chunks(rename_start..rename_end, true)
+                        .chunks(
+                            rename_start..rename_end,
+                            LanguageAwareStyling {
+                                tree_sitter: true,
+                                diagnostics: true,
+                            },
+                        )
                         .map(|chunk| {
                             if old_highlight_id.is_none() {
                                 old_highlight_id = chunk.syntax_highlight_id;
@@ -25007,7 +25018,13 @@ impl Editor {
             selection.range()
         };
 
-        let chunks = snapshot.chunks(range, true);
+        let chunks = snapshot.chunks(
+            range,
+            LanguageAwareStyling {
+                tree_sitter: true,
+                diagnostics: true,
+            },
+        );
         let mut lines = Vec::new();
         let mut line: VecDeque<Chunk> = VecDeque::new();
 
