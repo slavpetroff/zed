@@ -106,10 +106,16 @@ pub enum Model {
         reasoning_effort: Option<ReasoningEffort>,
         #[serde(default = "default_supports_chat_completions")]
         supports_chat_completions: bool,
+        #[serde(default = "default_supports_images")]
+        supports_images: bool,
     },
 }
 
 const fn default_supports_chat_completions() -> bool {
+    true
+}
+
+const fn default_supports_images() -> bool {
     true
 }
 
@@ -366,6 +372,8 @@ pub enum RequestMessage {
         content: Option<MessageContent>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
     },
     User {
         content: MessageContent,
