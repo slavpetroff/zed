@@ -54,6 +54,7 @@ use language::{
     proto::{deserialize_version, serialize_version},
 };
 use parking_lot::Mutex;
+use paths::{config_dir, home_dir};
 use pending_op::{PendingOp, PendingOpId, PendingOps, PendingOpsSummary};
 use postage::stream::Stream as _;
 use rpc::{
@@ -163,12 +164,29 @@ enum DiffKind {
     SinceOid(Option<git::Oid>),
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub enum GitAccess {
+    /// Either:
+    /// - the user owns `.git`
+    /// - the user doesn't own `.git`, but has both of:
+    ///   - OS-level read permissions
+    ///   - the directory is marked as safe (git config safe.directory)
+    #[default]
+    Yes,
+
+    /// The user is not the owner of `.git`, and one of the following is true:
+    /// - the directory is not marked as safe (git config safe.directory)
+    /// - the user does not have OS-level read permissions to `.git`
+    No,
+}
+
 enum GitStoreState {
     Local {
         next_repository_id: Arc<AtomicU64>,
         downstream: Option<LocalDownstreamState>,
         project_environment: Entity<ProjectEnvironment>,
         fs: Arc<dyn Fs>,
+        _fs_watches: Box<[Task<()>]>,
     },
     Remote {
         upstream_client: AnyProtoClient,
@@ -283,11 +301,18 @@ pub struct RepositorySnapshot {
     pub id: RepositoryId,
     pub statuses_by_path: SumTree<StatusEntry>,
     pub work_directory_abs_path: Arc<Path>,
-    /// The working directory of the original repository. For a normal
-    /// checkout this equals `work_directory_abs_path`. For a git worktree
-    /// checkout, this is the original repo's working directory — used to
-    /// anchor new worktree creation so they don't nest.
-    pub original_repo_abs_path: Arc<Path>,
+    /// Absolute path to the directory holding this worktree's Git state.
+    ///
+    /// For a linked worktree this is the worktree-specific directory under the
+    /// common Git directory, such as `<main>/.git/worktrees/<name>`.
+    pub repository_dir_abs_path: Arc<Path>,
+    /// Absolute path to the repository's common Git directory.
+    ///
+    /// For a normal checkout this is `<work_directory>/.git`. For a linked
+    /// worktree this is the common Git directory shared by all worktrees. If
+    /// that common directory is a bare repository, there may be no main
+    /// worktree path to derive from it.
+    pub common_dir_abs_path: Arc<Path>,
     pub path_style: PathStyle,
     pub branch: Option<Branch>,
     pub branch_list: Arc<[Branch]>,
@@ -362,6 +387,14 @@ pub struct Repository {
     initial_graph_data: HashMap<(LogSource, LogOrder), InitialGitGraphData>,
     commit_data_handler: CommitDataHandlerState,
     commit_data: HashMap<Oid, CommitDataState>,
+    refetch_repo_state: Arc<
+        dyn Fn(
+            &mut Context<Self>,
+        ) -> (
+            mpsc::UnboundedSender<GitJob>,
+            Shared<Task<Result<RepositoryState, String>>>,
+        ),
+    >,
 }
 
 impl std::ops::Deref for Repository {
@@ -465,6 +498,7 @@ pub enum GitStoreEvent {
     IndexWriteError(anyhow::Error),
     JobsUpdated,
     ConflictsUpdated,
+    GlobalConfigurationUpdated,
 }
 
 impl EventEmitter<RepositoryEvent> for Repository {}
@@ -492,6 +526,43 @@ impl GitStore {
         fs: Arc<dyn Fs>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let _fs_watches = if fs.is_fake() {
+            Box::new([])
+        } else {
+            [
+                config_dir().join("git/config"),
+                home_dir().join(".gitconfig"),
+            ]
+            .into_iter()
+            .map(|path| {
+                let fs = fs.clone();
+
+                cx.spawn(async move |this, cx| {
+                    let watcher = fs.watch(&path, Duration::from_millis(100));
+                    let (mut watcher, _) = watcher.await;
+                    while let Some(_) = watcher.next().await {
+                        let Ok(_) = this.update(cx, |this, cx| {
+                            for repo in this.repositories.values() {
+                                repo.update(cx, |this, cx| {
+                                    if this.job_sender.is_closed() {
+                                        let (job_sender, state) = (this.refetch_repo_state)(cx);
+                                        this.repository_state = state;
+                                        this.job_sender = job_sender;
+                                        this.schedule_scan(None, cx);
+                                    }
+                                })
+                            }
+                            cx.emit(GitStoreEvent::GlobalConfigurationUpdated);
+                        }) else {
+                            return;
+                        };
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+        };
+
         Self::new(
             worktree_store.clone(),
             buffer_store,
@@ -499,6 +570,7 @@ impl GitStore {
                 next_repository_id: Arc::new(AtomicU64::new(1)),
                 downstream: None,
                 project_environment: environment,
+                _fs_watches,
                 fs,
             },
             cx,
@@ -1386,6 +1458,7 @@ impl GitStore {
             downstream,
             next_repository_id,
             fs,
+            ..
         } = &self.state
         else {
             return;
@@ -1574,12 +1647,8 @@ impl GitStore {
                 ..
             } = update
             {
-                let original_repo_abs_path: Arc<Path> = git::repository::original_repo_path(
-                    work_directory_abs_path,
-                    common_dir_abs_path,
-                    repository_dir_abs_path,
-                )
-                .into();
+                let repository_dir_abs_path = repository_dir_abs_path.clone();
+                let common_dir_abs_path = common_dir_abs_path.clone();
                 let id = RepositoryId(next_repository_id.fetch_add(1, atomic::Ordering::Release));
                 let is_trusted = TrustedWorktrees::try_get_global(cx)
                     .map(|trusted_worktrees| {
@@ -1593,7 +1662,8 @@ impl GitStore {
                     let mut repo = Repository::local(
                         id,
                         work_directory_abs_path.clone(),
-                        original_repo_abs_path.clone(),
+                        repository_dir_abs_path.clone(),
+                        common_dir_abs_path.clone(),
                         dot_git_abs_path.clone(),
                         project_environment.downgrade(),
                         fs.clone(),
@@ -1836,9 +1906,10 @@ impl GitStore {
         &self.repositories
     }
 
-    /// Returns the original (main) repository working directory for the given worktree.
-    /// For normal checkouts this equals the worktree's own path; for linked
-    /// worktrees it points back to the original repo.
+    /// Returns the main repository working directory for the given worktree.
+    /// For normal checkouts this equals the worktree's own path. For linked
+    /// worktrees it points back to the main worktree, if one exists. Linked
+    /// worktrees attached to a bare repository have no main worktree path.
     pub fn original_repo_path_for_worktree(
         &self,
         worktree_id: WorktreeId,
@@ -1853,7 +1924,12 @@ impl GitStore {
                     .is_some_and(|ids| ids.contains(&worktree_id))
             })
             .and_then(|repo_id| self.repositories.get(repo_id))
-            .map(|repo| repo.read(cx).snapshot().original_repo_abs_path)
+            .and_then(|repo| {
+                repo.read(cx)
+                    .snapshot()
+                    .main_worktree_abs_path()
+                    .map(Arc::from)
+            })
     }
 
     pub fn status_for_buffer_id(&self, buffer_id: BufferId, cx: &App) -> Option<FileStatus> {
@@ -1931,7 +2007,7 @@ impl GitStore {
             GitStoreState::Local { fs, .. } => {
                 let fs = fs.clone();
                 cx.background_executor()
-                    .spawn(async move { fs.git_clone(&repo, &path).await })
+                    .spawn(async move { fs.git_clone(&path, &repo).await })
             }
             GitStoreState::Remote {
                 upstream_client,
@@ -1961,6 +2037,31 @@ impl GitStore {
         }
     }
 
+    pub fn git_config(&self, path: Arc<Path>, args: Vec<String>, cx: &App) -> Task<Result<String>> {
+        match &self.state {
+            GitStoreState::Local { fs, .. } => {
+                let fs = fs.clone();
+                cx.background_executor()
+                    .spawn(async move { fs.git_config(&path, args).await })
+            }
+            GitStoreState::Remote {
+                upstream_client, ..
+            } => {
+                // Prevent running git config commands for collab.
+                if upstream_client.is_via_collab() {
+                    return Task::ready(Err(anyhow!(
+                        "Git Config isn't support for project guests"
+                    )));
+                }
+
+                // TODO: Implement this for remote repositories.
+                Task::ready(Err(anyhow!(
+                    "Git Config isn't yet supported for remote projects"
+                )))
+            }
+        }
+    }
+
     async fn handle_update_repository(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::UpdateRepository>,
@@ -1973,8 +2074,12 @@ impl GitStore {
             let id = RepositoryId::from_proto(update.id);
             let client = this.upstream_client().context("no upstream client")?;
 
-            let original_repo_abs_path: Option<Arc<Path>> = update
-                .original_repo_abs_path
+            let repository_dir_abs_path: Option<Arc<Path>> = update
+                .repository_dir_abs_path
+                .as_deref()
+                .map(|p| Path::new(p).into());
+            let common_dir_abs_path: Option<Arc<Path>> = update
+                .common_dir_abs_path
                 .as_deref()
                 .map(|p| Path::new(p).into());
 
@@ -1985,7 +2090,8 @@ impl GitStore {
                     Repository::remote(
                         id,
                         Path::new(&update.abs_path).into(),
-                        original_repo_abs_path.clone(),
+                        repository_dir_abs_path.clone(),
+                        common_dir_abs_path.clone(),
                         path_style,
                         ProjectId(update.project_id),
                         client,
@@ -3835,14 +3941,20 @@ impl RepositorySnapshot {
     fn empty(
         id: RepositoryId,
         work_directory_abs_path: Arc<Path>,
-        original_repo_abs_path: Option<Arc<Path>>,
+        repository_dir_abs_path: Option<Arc<Path>>,
+        common_dir_abs_path: Option<Arc<Path>>,
         path_style: PathStyle,
     ) -> Self {
+        let repository_dir_abs_path =
+            repository_dir_abs_path.unwrap_or_else(|| work_directory_abs_path.join(".git").into());
+        let common_dir_abs_path =
+            common_dir_abs_path.unwrap_or_else(|| repository_dir_abs_path.clone());
+
         Self {
             id,
             statuses_by_path: Default::default(),
-            original_repo_abs_path: original_repo_abs_path
-                .unwrap_or_else(|| work_directory_abs_path.clone()),
+            repository_dir_abs_path,
+            common_dir_abs_path,
             work_directory_abs_path,
             branch: None,
             branch_list: Arc::from([]),
@@ -3889,9 +4001,10 @@ impl RepositorySnapshot {
                 .collect(),
             remote_upstream_url: self.remote_upstream_url.clone(),
             remote_origin_url: self.remote_origin_url.clone(),
-            original_repo_abs_path: Some(
-                self.original_repo_abs_path.to_string_lossy().into_owned(),
+            repository_dir_abs_path: Some(
+                self.repository_dir_abs_path.to_string_lossy().into_owned(),
             ),
+            common_dir_abs_path: Some(self.common_dir_abs_path.to_string_lossy().into_owned()),
             linked_worktrees: self
                 .linked_worktrees
                 .iter()
@@ -3971,14 +4084,32 @@ impl RepositorySnapshot {
                 .collect(),
             remote_upstream_url: self.remote_upstream_url.clone(),
             remote_origin_url: self.remote_origin_url.clone(),
-            original_repo_abs_path: Some(
-                self.original_repo_abs_path.to_string_lossy().into_owned(),
+            repository_dir_abs_path: Some(
+                self.repository_dir_abs_path.to_string_lossy().into_owned(),
             ),
+            common_dir_abs_path: Some(self.common_dir_abs_path.to_string_lossy().into_owned()),
             linked_worktrees: self
                 .linked_worktrees
                 .iter()
                 .map(worktree_to_proto)
                 .collect(),
+        }
+    }
+
+    /// Returns the main worktree path for this repository, if one exists.
+    ///
+    /// Linked worktrees attached to bare repositories do not have a main
+    /// worktree. For linked worktrees attached to a non-bare repository, the
+    /// common Git directory is the main worktree's `.git` directory.
+    pub fn main_worktree_abs_path(&self) -> Option<&Path> {
+        if self.is_linked_worktree() {
+            if self.common_dir_abs_path.file_name()? == std::ffi::OsStr::new(".git") {
+                self.common_dir_abs_path.parent()
+            } else {
+                None
+            }
+        } else {
+            Some(self.work_directory_abs_path.as_ref())
         }
     }
 
@@ -3990,7 +4121,7 @@ impl RepositorySnapshot {
     ///
     /// Submodules also return `true` here, since they are not linked worktrees.
     pub fn is_main_worktree(&self) -> bool {
-        self.work_directory_abs_path == self.original_repo_abs_path
+        !self.is_linked_worktree()
     }
 
     /// Returns true if this repository is a linked worktree, that is, one that
@@ -3998,7 +4129,7 @@ impl RepositorySnapshot {
     ///
     /// Returns `false` for both the main worktree and submodules.
     pub fn is_linked_worktree(&self) -> bool {
-        !self.is_main_worktree()
+        self.repository_dir_abs_path != self.common_dir_abs_path
     }
 
     pub fn linked_worktrees(&self) -> &[GitWorktree] {
@@ -4175,7 +4306,8 @@ impl Repository {
     fn local(
         id: RepositoryId,
         work_directory_abs_path: Arc<Path>,
-        original_repo_abs_path: Arc<Path>,
+        repository_dir_abs_path: Arc<Path>,
+        common_dir_abs_path: Arc<Path>,
         dot_git_abs_path: Arc<Path>,
         project_environment: WeakEntity<ProjectEnvironment>,
         fs: Arc<dyn Fs>,
@@ -4186,30 +4318,42 @@ impl Repository {
         let snapshot = RepositorySnapshot::empty(
             id,
             work_directory_abs_path.clone(),
-            Some(original_repo_abs_path),
+            Some(repository_dir_abs_path),
+            Some(common_dir_abs_path),
             PathStyle::local(),
         );
-        let state = cx
-            .spawn(async move |_, cx| {
-                LocalRepositoryState::new(
-                    work_directory_abs_path,
-                    dot_git_abs_path,
-                    project_environment,
-                    fs,
-                    is_trusted,
-                    cx,
-                )
-                .await
-                .map_err(|err| err.to_string())
-            })
-            .shared();
-        let job_sender = Repository::spawn_local_git_worker(state.clone(), cx);
-        let state = cx
-            .spawn(async move |_, _| {
-                let state = state.await?;
-                Ok(RepositoryState::Local(state))
-            })
-            .shared();
+        let refetch_repo_state = Arc::new(move |cx: &mut Context<Self>| {
+            let work_directory_abs_path = work_directory_abs_path.clone();
+            let dot_git_abs_path = dot_git_abs_path.clone();
+            let project_environment = project_environment.clone();
+            let fs = fs.clone();
+
+            let state = cx
+                .spawn(async move |_, cx| {
+                    LocalRepositoryState::new(
+                        work_directory_abs_path,
+                        dot_git_abs_path,
+                        project_environment,
+                        fs,
+                        is_trusted,
+                        cx,
+                    )
+                    .await
+                    .map_err(|err| err.to_string())
+                })
+                .shared();
+            let job_sender = Repository::spawn_local_git_worker(state.clone(), cx);
+            let state = cx
+                .spawn(async move |_, _| {
+                    let state = state.await?;
+                    Ok(RepositoryState::Local(state))
+                })
+                .shared();
+
+            (job_sender, state)
+        });
+
+        let (job_sender, state) = (refetch_repo_state)(cx);
 
         // todo(git_graph_remote): Make this subscription on both remote/local repo
         cx.subscribe_self(move |this, event: &RepositoryEvent, _| match event {
@@ -4244,13 +4388,15 @@ impl Repository {
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             commit_data_handler: CommitDataHandlerState::Closed,
+            refetch_repo_state,
         }
     }
 
     fn remote(
         id: RepositoryId,
         work_directory_abs_path: Arc<Path>,
-        original_repo_abs_path: Option<Arc<Path>>,
+        repository_dir_abs_path: Option<Arc<Path>>,
+        common_dir_abs_path: Option<Arc<Path>>,
         path_style: PathStyle,
         project_id: ProjectId,
         client: AnyProtoClient,
@@ -4260,12 +4406,22 @@ impl Repository {
         let snapshot = RepositorySnapshot::empty(
             id,
             work_directory_abs_path,
-            original_repo_abs_path,
+            repository_dir_abs_path,
+            common_dir_abs_path,
             path_style,
         );
-        let repository_state = RemoteRepositoryState { project_id, client };
-        let job_sender = Self::spawn_remote_git_worker(repository_state.clone(), cx);
-        let repository_state = Task::ready(Ok(RepositoryState::Remote(repository_state))).shared();
+        let refetch_repo_state = Arc::new(move |cx: &mut Context<Self>| {
+            let repository_state = RemoteRepositoryState {
+                project_id,
+                client: client.clone(),
+            };
+            let job_sender = Self::spawn_remote_git_worker(repository_state.clone(), cx);
+            let repository_state =
+                Task::ready(Ok(RepositoryState::Remote(repository_state))).shared();
+            (job_sender, repository_state)
+        });
+
+        let (job_sender, repository_state) = (refetch_repo_state)(cx);
         Self {
             this: cx.weak_entity(),
             snapshot,
@@ -4282,6 +4438,7 @@ impl Repository {
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             commit_data_handler: CommitDataHandlerState::Closed,
+            refetch_repo_state,
         }
     }
 
@@ -5123,6 +5280,16 @@ impl Repository {
         result_tx: smol::channel::Sender<(Oid, CommitData)>,
         background_executor: BackgroundExecutor,
     ) {
+        async fn receive_commit_data_request(
+            request_rx: &smol::channel::Receiver<Oid>,
+        ) -> Option<Oid> {
+            if request_rx.is_closed() && request_rx.is_empty() {
+                future::pending().await
+            } else {
+                request_rx.recv().await.ok()
+            }
+        }
+
         let reader = match backend.commit_data_reader() {
             Ok(reader) => reader,
             Err(error) => {
@@ -5131,19 +5298,38 @@ impl Repository {
             }
         };
 
+        let read_commit_data = |sha| reader.read(sha).map(move |result| (sha, result));
+        let mut read_futures = FuturesUnordered::new();
+
         loop {
-            let timeout = background_executor.timer(std::time::Duration::from_secs(10));
+            if read_futures.is_empty() {
+                let timeout = background_executor.timer(Duration::from_secs(10));
+
+                futures::select_biased! {
+                    sha = futures::FutureExt::fuse(receive_commit_data_request(&request_rx)) => {
+                        if let Some(sha) = sha {
+                            read_futures.push(read_commit_data(sha));
+                        }
+                    }
+                    _ = futures::FutureExt::fuse(timeout) => {
+                        break;
+                    }
+                }
+            }
+
+            let next_read = read_futures.next().fuse();
+            futures::pin_mut!(next_read);
 
             futures::select_biased! {
-                sha = futures::FutureExt::fuse(request_rx.recv()) => {
-                    let Ok(sha) = sha else {
-                        break;
+                result = next_read => {
+                    let Some((sha, result)) = result else {
+                        continue;
                     };
 
-                    match reader.read(sha).await {
+                    match result {
                         Ok(commit_data) => {
                             if result_tx.send((sha, commit_data)).await.is_err() {
-                                break;
+                                return;
                             }
                         }
                         Err(error) => {
@@ -5151,8 +5337,10 @@ impl Repository {
                         }
                     }
                 }
-                _ = futures::FutureExt::fuse(timeout) => {
-                    break;
+                sha = futures::FutureExt::fuse(receive_commit_data_request(&request_rx)) => {
+                    if let Some(sha) = sha {
+                        read_futures.push(read_commit_data(sha));
+                    }
                 }
             }
         }
@@ -5545,8 +5733,9 @@ impl Repository {
             snapshot
                 .status()
                 .filter_map(|entry| {
-                    if let Some(ops) =
-                        pending_ops.get(&PathKey(entry.repo_path.as_ref().clone()), ())
+                    if let Some(ops) = pending_ops
+                        .get(&PathKey(entry.repo_path.as_ref().clone()), ())
+                        .filter(|ops| !ops.last_op_errored())
                     {
                         if ops.staging() || ops.staged() {
                             None
@@ -5578,8 +5767,9 @@ impl Repository {
             snapshot
                 .status()
                 .filter_map(|entry| {
-                    if let Some(ops) =
-                        pending_ops.get(&PathKey(entry.repo_path.as_ref().clone()), ())
+                    if let Some(ops) = pending_ops
+                        .get(&PathKey(entry.repo_path.as_ref().clone()), ())
+                        .filter(|ops| !ops.last_op_errored())
                     {
                         if !ops.staging() && !ops.staged() {
                             None
@@ -6322,15 +6512,13 @@ impl Repository {
     }
 
     /// If this is a linked worktree (*NOT* the main checkout of a repository),
-    /// returns the pathed for the linked worktree.
+    /// returns the path for the linked worktree.
     ///
     /// Returns None if this is the main checkout.
     pub fn linked_worktree_path(&self) -> Option<&Arc<Path>> {
-        if self.work_directory_abs_path != self.original_repo_abs_path {
-            Some(&self.work_directory_abs_path)
-        } else {
-            None
-        }
+        self.snapshot
+            .is_linked_worktree()
+            .then_some(&self.work_directory_abs_path)
     }
 
     pub fn path_for_new_linked_worktree(
@@ -6338,11 +6526,15 @@ impl Repository {
         branch_name: &str,
         worktree_directory_setting: &str,
     ) -> Result<PathBuf> {
-        let original_repo = self.original_repo_abs_path.clone();
-        let project_name = original_repo
+        let repository_anchor = self
+            .snapshot
+            .main_worktree_abs_path()
+            .unwrap_or(self.common_dir_abs_path.as_ref());
+        let project_name = repository_anchor
             .file_name()
             .ok_or_else(|| anyhow!("git repo must have a directory name"))?;
-        let directory = worktrees_directory_for_repo(&original_repo, worktree_directory_setting)?;
+        let directory =
+            worktrees_directory_for_repo(repository_anchor, worktree_directory_setting)?;
         Ok(directory.join(branch_name).join(project_name))
     }
 
@@ -6592,7 +6784,11 @@ impl Repository {
 
     pub fn remove_worktree(&mut self, path: PathBuf, force: bool) -> oneshot::Receiver<Result<()>> {
         let id = self.id;
-        let original_repo_abs_path = self.snapshot.original_repo_abs_path.clone();
+        let repository_anchor_path: Arc<Path> = self
+            .snapshot
+            .main_worktree_abs_path()
+            .unwrap_or(self.snapshot.common_dir_abs_path.as_ref())
+            .into();
         self.send_job(
             Some(format!("git worktree remove: {}", path.display()).into()),
             move |repo, cx| async move {
@@ -6635,7 +6831,7 @@ impl Repository {
 
                         let managed_worktree_base = cx.update(|cx| {
                             let setting = &ProjectSettings::get_global(cx).git.worktree_directory;
-                            worktrees_directory_for_repo(&original_repo_abs_path, setting).log_err()
+                            worktrees_directory_for_repo(&repository_anchor_path, setting).log_err()
                         });
 
                         if let Some(managed_worktree_base) = managed_worktree_base {
@@ -7013,8 +7209,12 @@ impl Repository {
         update: proto::UpdateRepository,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        if let Some(main_path) = &update.original_repo_abs_path {
-            self.snapshot.original_repo_abs_path = Path::new(main_path.as_str()).into();
+        if let Some(repository_dir_abs_path) = &update.repository_dir_abs_path {
+            self.snapshot.repository_dir_abs_path =
+                Path::new(repository_dir_abs_path.as_str()).into();
+        }
+        if let Some(common_dir_abs_path) = &update.common_dir_abs_path {
+            self.snapshot.common_dir_abs_path = Path::new(common_dir_abs_path.as_str()).into();
         }
 
         let new_branch = update.branch_summary.as_ref().map(proto_to_branch);
@@ -7588,6 +7788,23 @@ impl Repository {
         self.pending_ops.edit(edits, ());
         ids
     }
+
+    pub fn access(&mut self, _cx: &App) -> oneshot::Receiver<GitAccess> {
+        self.send_job(None, move |git_repo, _cx| async move {
+            match git_repo {
+                // TODO: Correctly handle remote repositories, where the user
+                // that's running the Zed remote may not own the `.git/`
+                // directory. For now we just return `GitAccess::Yes` so that
+                // remoting continues working as expected.
+                RepositoryState::Remote(..) => GitAccess::Yes,
+                RepositoryState::Local(state) => match state.backend.status(&[]).await {
+                    Ok(_) => GitAccess::Yes,
+                    Err(_) => GitAccess::No,
+                },
+            }
+        })
+    }
+
     pub fn default_remote_url(&self) -> Option<String> {
         self.remote_upstream_url
             .clone()
@@ -7630,7 +7847,7 @@ pub async fn resolve_git_worktree_to_main_repo(fs: &dyn Fs, path: &Path) -> Opti
 ///
 /// Returns `Ok(resolved_path)` or an error with a user-facing message.
 pub fn worktrees_directory_for_repo(
-    original_repo_abs_path: &Path,
+    repository_anchor_path: &Path,
     worktree_directory_setting: &str,
 ) -> Result<PathBuf> {
     // Check the original setting before trimming, since a path like "///"
@@ -7656,25 +7873,25 @@ pub fn worktrees_directory_for_repo(
         anyhow::bail!("git.worktree_directory must not be \"..\" (use \"../some-name\" instead)");
     }
 
-    let joined = original_repo_abs_path.join(trimmed);
+    let joined = repository_anchor_path.join(trimmed);
     let resolved = util::normalize_path(&joined);
-    let resolved = if resolved.starts_with(original_repo_abs_path) {
+    let resolved = if resolved.starts_with(repository_anchor_path) {
         resolved
-    } else if let Some(repo_dir_name) = original_repo_abs_path.file_name() {
+    } else if let Some(repo_dir_name) = repository_anchor_path.file_name() {
         resolved.join(repo_dir_name)
     } else {
         resolved
     };
 
-    let parent = original_repo_abs_path
+    let parent = repository_anchor_path
         .parent()
-        .unwrap_or(original_repo_abs_path);
+        .unwrap_or(repository_anchor_path);
 
     if !resolved.starts_with(parent) {
         anyhow::bail!(
             "git.worktree_directory resolved to {resolved:?}, which is outside \
              the project root and its parent directory. It must resolve to a \
-             subdirectory of {original_repo_abs_path:?} or a sibling of it."
+             subdirectory of {repository_anchor_path:?} or a sibling of it."
         );
     }
 
@@ -7718,6 +7935,29 @@ async fn remove_empty_managed_worktree_ancestors(fs: &dyn Fs, child_path: &Path,
         }
 
         current = parent;
+    }
+}
+
+/// Returns the repository's identity path given its common Git directory.
+///
+/// This is the canonical, on-disk path used for project grouping and as the
+/// basis for display names. The goal is to return the directory the user
+/// thinks of as "the project":
+///
+/// - If `common_dir`'s last component starts with `.` (e.g. `.git` for a
+///   normal checkout, or `.bare` for a bare clone), the parent directory is
+///   returned. Both of these are internal Git directories; the parent is the
+///   meaningful project root.
+/// - Otherwise (e.g. `zed.git` for a bare clone), `common_dir` itself is
+///   returned — it is already a meaningful on-disk path.
+pub fn repo_identity_path(common_dir: &Path) -> &Path {
+    let is_dot_entry = common_dir
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+    if is_dot_entry {
+        common_dir.parent().unwrap_or(common_dir)
+    } else {
+        common_dir
     }
 }
 
