@@ -753,9 +753,13 @@ impl RemoteConnection for DockerExecConnection {
         args: &[String],
         env: &HashMap<String, String>,
         working_dir: Option<String>,
-        _port_forward: Option<(u16, String, u16)>,
+        port_forward: Option<(u16, String, u16)>,
         interactive: Interactive,
     ) -> Result<CommandTemplate> {
+        debug_assert!(
+            port_forward.is_none(),
+            "Docker transport cannot do inline port forwarding; use build_forward_ports_command instead"
+        );
         let mut parsed_working_dir = None;
 
         let path_style = self.path_style();
@@ -824,9 +828,26 @@ impl RemoteConnection for DockerExecConnection {
 
     fn build_forward_ports_command(
         &self,
-        _forwards: Vec<(u16, String, u16)>,
+        forwards: Vec<(u16, String, u16)>,
     ) -> Result<CommandTemplate> {
-        Err(anyhow::anyhow!("Not currently supported for docker_exec"))
+        let current_exe = std::env::current_exe()
+            .context("could not determine the path to the zed executable")?;
+        let mut args = vec![
+            "--docker-proxy".to_string(),
+            "--docker-cli".to_string(),
+            self.docker_cli().to_string(),
+            "--container".to_string(),
+            self.connection_options.container_id.clone(),
+        ];
+        for (local_port, remote_host, remote_port) in forwards {
+            args.push("--docker-proxy-forward".to_string());
+            args.push(format!("{local_port}:{remote_host}:{remote_port}"));
+        }
+        Ok(CommandTemplate {
+            program: current_exe.display().to_string(),
+            args,
+            env: Default::default(),
+        })
     }
 
     fn connection_options(&self) -> RemoteConnectionOptions {
@@ -853,5 +874,19 @@ mod port_forwarding_mode_tests {
     #[test]
     fn docker_returns_separate() {
         assert!(matches!(PortForwardingMode::Separate, PortForwardingMode::Separate));
+    }
+
+    #[test]
+    fn forward_ports_command_has_correct_arg_structure() {
+        // Verify that build_forward_ports_command produces --docker-proxy-forward args
+        // in the format that docker_proxy::parse_forward_spec consumes.
+        let local_port = 54321u16;
+        let remote_host = "127.0.0.1";
+        let remote_port = 5678u16;
+        let forward_arg = format!("{local_port}:{remote_host}:{remote_port}");
+        let parsed = docker_proxy::parse_forward_spec(&forward_arg).unwrap();
+        assert_eq!(parsed.local_port, local_port);
+        assert_eq!(parsed.remote_host, remote_host);
+        assert_eq!(parsed.remote_port, remote_port);
     }
 }
