@@ -17,7 +17,7 @@ use worktree::Snapshot;
 
 use crate::{
     DevContainerContext, DevContainerFeature, DevContainerTemplate,
-    devcontainer_json::DevContainer,
+    devcontainer_json::{DevContainer, ForwardPort},
     devcontainer_manifest::{read_devcontainer_configuration, spawn_dev_container},
     devcontainer_templates_repository, get_latest_oci_manifest, get_oci_token, ghcr_registry,
     oci::download_oci_tarball,
@@ -250,6 +250,19 @@ pub fn find_configs_in_snapshot(snapshot: &Snapshot) -> Vec<DevContainerConfig> 
     configs
 }
 
+pub(crate) fn build_forward_specs(ports: &[ForwardPort]) -> Vec<(u16, String, u16)> {
+    ports
+        .iter()
+        .filter_map(|p| match p {
+            ForwardPort::Number(n) => Some((*n, "127.0.0.1".to_string(), *n)),
+            ForwardPort::String(s) => {
+                log::warn!("devcontainer: service:port forwardPorts entry '{s}' not yet supported, skipping");
+                None
+            }
+        })
+        .collect()
+}
+
 pub async fn start_dev_container_with_config(
     context: DevContainerContext,
     config: Option<DevContainerConfig>,
@@ -277,22 +290,69 @@ pub async fn start_dev_container_with_config(
             remote_env,
             ..
         }) => {
-            let project_name =
-                match read_devcontainer_configuration(actual_config, &context, environment).await {
-                    Ok(DevContainer {
-                        name: Some(name), ..
-                    }) => name,
-                    _ => get_backup_project_name(&remote_workspace_folder, &container_id),
-                };
+            let parsed_config =
+                read_devcontainer_configuration(actual_config, &context, environment).await;
+
+            let project_name = match &parsed_config {
+                Ok(DevContainer {
+                    name: Some(name), ..
+                }) => name.clone(),
+                _ => get_backup_project_name(&remote_workspace_folder, &container_id),
+            };
 
             let connection = DevContainerConnection {
                 name: project_name,
-                container_id,
+                container_id: container_id.clone(),
                 use_podman: context.use_podman,
                 remote_user,
                 extension_ids,
                 remote_env: remote_env.into_iter().collect(),
             };
+
+            let forward_ports = parsed_config
+                .as_ref()
+                .ok()
+                .and_then(|c| c.forward_ports.as_deref())
+                .unwrap_or_default();
+            let specs = build_forward_specs(forward_ports);
+            if !specs.is_empty() {
+                let current_exe = std::env::current_exe().unwrap_or_default();
+                let docker_cli = if context.use_podman { "podman" } else { "docker" };
+                let mut args = vec![
+                    "--docker-proxy".to_string(),
+                    "--docker-cli".to_string(),
+                    docker_cli.to_string(),
+                    "--container".to_string(),
+                    container_id.clone(),
+                ];
+                for (local, host, remote) in &specs {
+                    args.push("--docker-proxy-forward".to_string());
+                    args.push(format!("{local}:{host}:{remote}"));
+                }
+                let mut command = util::command::new_std_command(&current_exe);
+                command.args(&args);
+                match util::process::Child::spawn(
+                    command,
+                    std::process::Stdio::null(),
+                    std::process::Stdio::null(),
+                    std::process::Stdio::null(),
+                ) {
+                    Ok(mut child) => {
+                        log::info!(
+                            "devcontainer: started port forwarding for {} port(s)",
+                            specs.len()
+                        );
+                        // Detach the proxy: keep it running for the session.
+                        // smol::process::Child kills the process when dropped,
+                        // so we wait in a background task so the process is reaped
+                        // when it eventually exits (e.g. when the container stops).
+                        smol::spawn(async move { child.status().await.ok(); }).detach();
+                    }
+                    Err(e) => {
+                        log::error!("devcontainer: failed to start port forwarding: {e:#}");
+                    }
+                }
+            }
 
             Ok((connection, remote_workspace_folder))
         }
@@ -486,7 +546,8 @@ fn get_backup_project_name(remote_workspace_folder: &str, container_id: &str) ->
 mod tests {
     use std::path::PathBuf;
 
-    use crate::devcontainer_api::{DevContainerConfig, find_configs_in_snapshot};
+    use crate::devcontainer_api::{DevContainerConfig, build_forward_specs, find_configs_in_snapshot};
+    use crate::devcontainer_json::ForwardPort;
     use fs::FakeFs;
     use gpui::TestAppContext;
     use project::Project;
@@ -750,5 +811,31 @@ mod tests {
 
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0], DevContainerConfig::root_config());
+    }
+
+    #[test]
+    fn build_forward_specs_number_port() {
+        let ports = vec![ForwardPort::Number(8000), ForwardPort::Number(5432)];
+        let specs = build_forward_specs(&ports);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0], (8000u16, "127.0.0.1".to_string(), 8000u16));
+        assert_eq!(specs[1], (5432u16, "127.0.0.1".to_string(), 5432u16));
+    }
+
+    #[test]
+    fn build_forward_specs_skips_string_ports() {
+        let ports = vec![
+            ForwardPort::String("db:5432".to_string()),
+            ForwardPort::Number(3000),
+        ];
+        let specs = build_forward_specs(&ports);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0], (3000u16, "127.0.0.1".to_string(), 3000u16));
+    }
+
+    #[test]
+    fn build_forward_specs_empty() {
+        let specs = build_forward_specs(&[]);
+        assert!(specs.is_empty());
     }
 }
