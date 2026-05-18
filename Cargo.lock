@@ -5091,6 +5091,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "docker_proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-lite 1.13.0",
+ "log",
+ "smol",
+]
+
+[[package]]
 name = "docs_preprocessor"
 version = "0.1.0"
 dependencies = [
@@ -22492,6 +22502,7 @@ dependencies = [
  "debugger_ui",
  "dev_container",
  "diagnostics",
+ "docker_proxy",
  "edit_prediction",
  "edit_prediction_ui",
  "editor",

@@ -1,0 +1,19 @@
+[package]
+name = "docker_proxy"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "TCP-over-docker-exec port proxy used by Zed for devcontainer DAP debugging"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/docker_proxy.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+futures-lite.workspace = true
+smol.workspace = true
+log.workspace = true

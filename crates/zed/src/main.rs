@@ -246,6 +246,26 @@ fn main() {
         }
     }
 
+    // `zed --docker-proxy` bridges host TCP ports into dev containers for DAP debugging
+    if args.docker_proxy {
+        let container = args.container.unwrap_or_default();
+        let docker_cli_path = args.docker_cli.unwrap_or_else(|| "docker".to_string());
+        let forwards: Vec<docker_proxy::ForwardSpec> = args
+            .docker_proxy_forward
+            .iter()
+            .map(|spec| docker_proxy::parse_forward_spec(spec))
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|error| {
+                eprintln!("docker-proxy: invalid forward spec: {error:#}");
+                process::exit(1);
+            });
+        if let Err(error) = docker_proxy::main(&docker_cli_path, &container, &forwards) {
+            eprintln!("docker-proxy error: {error:#}");
+            process::exit(1);
+        }
+        return;
+    }
+
     #[cfg(all(not(debug_assertions), target_os = "windows"))]
     unsafe {
         use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
@@ -1767,6 +1787,25 @@ struct Args {
     /// by having Zed act like netcat communicating over a Unix socket.
     #[arg(long, hide = true)]
     nc: Option<String>,
+
+    /// Forward TCP ports from a running Docker/Podman container to localhost.
+    ///
+    /// Bridges host TCP ports into dev containers via docker exec + bash /dev/tcp.
+    /// Used internally for DAP debug sessions in dev containers.
+    #[arg(long, hide = true)]
+    docker_proxy: bool,
+
+    /// Container ID for --docker-proxy mode.
+    #[arg(long, hide = true, requires = "docker_proxy")]
+    container: Option<String>,
+
+    /// Path to docker/podman CLI for --docker-proxy mode.
+    #[arg(long, hide = true, requires = "docker_proxy")]
+    docker_cli: Option<String>,
+
+    /// Port forward spec (local_port:remote_host:remote_port). Repeatable.
+    #[arg(long = "docker-proxy-forward", hide = true, requires = "docker_proxy")]
+    docker_proxy_forward: Vec<String>,
 
     /// Used for recording minidumps on crashes by having Zed run a separate
     /// process communicating over a socket.

@@ -155,6 +155,7 @@ menu.workspace = true
 migrator.workspace = true
 miniprofiler_ui.workspace = true
 mimalloc = { version = "0.1", optional = true }
+docker_proxy.workspace = true
 nc.workspace = true
 node_runtime.workspace = true
 notifications.workspace = true

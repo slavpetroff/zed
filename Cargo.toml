@@ -46,6 +46,7 @@ members = [
     "crates/csv_preview",
     "crates/dap",
     "crates/dap_adapters",
+    "crates/docker_proxy",
     "crates/db",
     "crates/debug_adapter_extension",
     "crates/debugger_tools",
@@ -396,6 +397,7 @@ migrator = { path = "crates/migrator" }
 mistral = { path = "crates/mistral" }
 multi_buffer = { path = "crates/multi_buffer" }
 miniprofiler_ui = { path = "crates/miniprofiler_ui" }
+docker_proxy = { path = "crates/docker_proxy" }
 nc = { path = "crates/nc" }
 net = { path = "crates/net" }
 node_runtime = { path = "crates/node_runtime" }
