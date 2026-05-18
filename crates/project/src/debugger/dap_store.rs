@@ -4,7 +4,7 @@ use super::{
     locators,
     session::{self, Session, SessionStateEvent},
 };
-use remote::Interactive;
+use remote::{Interactive, PortForwardingMode};
 
 use crate::{
     InlayHint, InlayHintLabel, ProjectEnvironment, ResolveState,
@@ -320,25 +320,56 @@ impl DapStore {
                     let response = request.await?;
                     let binary = DebugAdapterBinary::from_proto(response)?;
 
-                    let port_forwarding;
+                    let forwarding_mode =
+                        remote.read_with(cx, |remote, _cx| remote.port_forwarding_mode());
+
+                    let port_forwarding_inline;
+                    let port_forward_command;
                     let connection;
+
                     if let Some(c) = binary.connection {
                         let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
-                        let port;
-                        if remote.read_with(cx, |remote, _cx| remote.shares_network_interface()) {
-                            port = c.port;
-                            port_forwarding = None;
-                        } else {
-                            port = dap::transport::TcpTransport::unused_port(host).await?;
-                            port_forwarding = Some((port, c.host.to_string(), c.port));
+                        match forwarding_mode {
+                            PortForwardingMode::SharedInterface => {
+                                port_forwarding_inline = None;
+                                port_forward_command = None;
+                                connection = Some(TcpArguments {
+                                    port: c.port,
+                                    host,
+                                    timeout: c.timeout,
+                                });
+                            }
+                            PortForwardingMode::Inline => {
+                                let local_port =
+                                    dap::transport::TcpTransport::unused_port(host).await?;
+                                port_forwarding_inline =
+                                    Some((local_port, c.host.to_string(), c.port));
+                                port_forward_command = None;
+                                connection = Some(TcpArguments {
+                                    port: local_port,
+                                    host,
+                                    timeout: c.timeout,
+                                });
+                            }
+                            PortForwardingMode::Separate => {
+                                let local_port =
+                                    dap::transport::TcpTransport::unused_port(host).await?;
+                                let forwards = vec![(local_port, c.host.to_string(), c.port)];
+                                let pf_cmd = remote.read_with(cx, |remote, _cx| {
+                                    remote.build_forward_ports_command(forwards)
+                                })?;
+                                port_forwarding_inline = None;
+                                port_forward_command = Some(pf_cmd);
+                                connection = Some(TcpArguments {
+                                    port: local_port,
+                                    host,
+                                    timeout: c.timeout,
+                                });
+                            }
                         }
-                        connection = Some(TcpArguments {
-                            port,
-                            host,
-                            timeout: c.timeout,
-                        })
                     } else {
-                        port_forwarding = None;
+                        port_forwarding_inline = None;
+                        port_forward_command = None;
                         connection = None;
                     }
 
@@ -348,7 +379,7 @@ impl DapStore {
                             &binary.arguments,
                             &binary.envs,
                             binary.cwd.map(|path| path.display().to_string()),
-                            port_forwarding,
+                            port_forwarding_inline,
                             Interactive::No,
                         )
                     })?;
@@ -360,7 +391,7 @@ impl DapStore {
                         cwd: None,
                         connection,
                         request_args: binary.request_args,
-                        port_forward_command: None,
+                        port_forward_command,
                     })
                 })
             }
@@ -1034,5 +1065,19 @@ impl dap::adapters::DapDelegate for DapAdapterDelegate {
 
     fn is_headless(&self) -> bool {
         self.is_headless
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn port_forwarding_mode_enum_variants_exist() {
+        use remote::PortForwardingMode;
+        assert!(matches!(PortForwardingMode::Inline, PortForwardingMode::Inline));
+        assert!(matches!(PortForwardingMode::Separate, PortForwardingMode::Separate));
+        assert!(matches!(
+            PortForwardingMode::SharedInterface,
+            PortForwardingMode::SharedInterface
+        ));
     }
 }
