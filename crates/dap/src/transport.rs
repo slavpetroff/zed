@@ -589,6 +589,9 @@ impl Transport for TcpTransport {
     }
 
     fn kill(&mut self) {
+        if let Some(mut proxy) = self.port_forward_process.take() {
+            proxy.kill().log_err();
+        }
         if let Some(process) = &mut *self.process.lock() {
             process.kill().log_err();
         }
