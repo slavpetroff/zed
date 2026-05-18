@@ -26,7 +26,7 @@ use rpc::proto::Envelope;
 
 use crate::{
     RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions, RemoteOs, RemotePlatform,
-    remote_client::{CommandTemplate, Interactive},
+    remote_client::{CommandTemplate, Interactive, PortForwardingMode},
     transport::parse_platform,
 };
 
@@ -625,6 +625,11 @@ impl RemoteConnection for DockerExecConnection {
     fn has_wsl_interop(&self) -> bool {
         false
     }
+
+    fn port_forwarding_mode(&self) -> PortForwardingMode {
+        PortForwardingMode::Separate
+    }
+
     fn start_proxy(
         &self,
         unique_identifier: String,
@@ -838,5 +843,15 @@ impl RemoteConnection for DockerExecConnection {
 
     fn default_system_shell(&self) -> String {
         String::from("/bin/sh")
+    }
+}
+
+#[cfg(test)]
+mod port_forwarding_mode_tests {
+    use crate::remote_client::PortForwardingMode;
+
+    #[test]
+    fn docker_returns_separate() {
+        assert!(matches!(PortForwardingMode::Separate, PortForwardingMode::Separate));
     }
 }

@@ -1,6 +1,6 @@
 use crate::{
     RemoteArch, RemoteClientDelegate, RemoteOs, RemotePlatform,
-    remote_client::{CommandTemplate, Interactive, RemoteConnection, RemoteConnectionOptions},
+    remote_client::{CommandTemplate, Interactive, PortForwardingMode, RemoteConnection, RemoteConnectionOptions},
     transport::{parse_platform, parse_shell},
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -430,6 +430,10 @@ impl RemoteConnection for WslRemoteConnection {
 
     fn shares_network_interface(&self) -> bool {
         true
+    }
+
+    fn port_forwarding_mode(&self) -> PortForwardingMode {
+        PortForwardingMode::SharedInterface
     }
 
     fn build_command(

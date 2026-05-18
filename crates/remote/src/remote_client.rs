@@ -918,6 +918,11 @@ impl RemoteClient {
             .map_or(false, |connection| connection.shares_network_interface())
     }
 
+    pub fn port_forwarding_mode(&self) -> PortForwardingMode {
+        self.remote_connection()
+            .map_or(PortForwardingMode::Inline, |c| c.port_forwarding_mode())
+    }
+
     pub fn has_wsl_interop(&self) -> bool {
         self.remote_connection()
             .map_or(false, |connection| connection.has_wsl_interop())
@@ -1505,6 +1510,15 @@ pub struct OpenWslPath {
     pub paths: Vec<PathBuf>,
 }
 
+pub enum PortForwardingMode {
+    /// The port forward is baked into the launch command (SSH: adds `-L` flag).
+    Inline,
+    /// The transport cannot do inline forwarding; a separate sidecar process is required.
+    Separate,
+    /// Host and remote share a network interface (WSL); no forwarding needed.
+    SharedInterface,
+}
+
 #[async_trait(?Send)]
 pub trait RemoteConnection: Send + Sync {
     fn start_proxy(
@@ -1527,6 +1541,9 @@ pub trait RemoteConnection: Send + Sync {
     fn has_been_killed(&self) -> bool;
     fn shares_network_interface(&self) -> bool {
         false
+    }
+    fn port_forwarding_mode(&self) -> PortForwardingMode {
+        PortForwardingMode::Inline
     }
     fn build_command(
         &self,

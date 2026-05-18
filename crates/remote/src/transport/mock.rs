@@ -30,8 +30,8 @@
 //! ```
 
 use crate::remote_client::{
-    ChannelClient, CommandTemplate, Interactive, RemoteClientDelegate, RemoteConnection,
-    RemoteConnectionOptions,
+    ChannelClient, CommandTemplate, Interactive, PortForwardingMode, RemoteClientDelegate,
+    RemoteConnection, RemoteConnectionOptions,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -191,6 +191,10 @@ impl RemoteConnection for MockRemoteConnection {
 
     fn has_been_killed(&self) -> bool {
         false
+    }
+
+    fn port_forwarding_mode(&self) -> PortForwardingMode {
+        PortForwardingMode::Inline
     }
 
     fn build_command(
