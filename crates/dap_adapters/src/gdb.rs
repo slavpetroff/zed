@@ -260,6 +260,7 @@ impl DebugAdapter for GdbDebugAdapter {
                 request: self.request_kind(&config.config).await?,
                 configuration,
             },
+            port_forward_command: None,
         })
     }
 }

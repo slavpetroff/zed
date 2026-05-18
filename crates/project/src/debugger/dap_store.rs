@@ -360,6 +360,7 @@ impl DapStore {
                         cwd: None,
                         connection,
                         request_args: binary.request_args,
+                        port_forward_command: None,
                     })
                 })
             }

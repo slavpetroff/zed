@@ -87,6 +87,7 @@ impl DebugAdapterClient {
                 cwd: Default::default(),
                 connection: Some(connection),
                 request_args: binary.request_args,
+                port_forward_command: None,
             }
         } else {
             self.binary.clone()
@@ -299,6 +300,7 @@ mod tests {
                     configuration: serde_json::Value::Null,
                     request: dap_types::StartDebuggingRequestArgumentsRequest::Launch,
                 },
+                port_forward_command: None,
             },
             Box::new(|_| {}),
             &mut cx.to_async(),
@@ -367,6 +369,7 @@ mod tests {
                     configuration: serde_json::Value::Null,
                     request: dap_types::StartDebuggingRequestArgumentsRequest::Launch,
                 },
+                port_forward_command: None,
             },
             Box::new({
                 let called_event_handler = called_event_handler.clone();
@@ -418,6 +421,7 @@ mod tests {
                     configuration: serde_json::Value::Null,
                     request: dap_types::StartDebuggingRequestArgumentsRequest::Launch,
                 },
+                port_forward_command: None,
             },
             Box::new({
                 let called_event_handler = called_event_handler.clone();

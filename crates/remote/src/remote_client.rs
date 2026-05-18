@@ -106,7 +106,7 @@ pub struct RemotePlatform {
     pub arch: RemoteArch,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct CommandTemplate {
     pub program: String,
     pub args: Vec<String>,

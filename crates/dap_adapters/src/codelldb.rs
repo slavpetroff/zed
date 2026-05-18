@@ -424,6 +424,7 @@ impl DebugAdapter for CodeLldbDebugAdapter {
                 .await?,
             envs: user_env.unwrap_or_default(),
             connection: None,
+            port_forward_command: None,
         })
     }
 }

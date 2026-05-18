@@ -24,6 +24,7 @@ use std::{
     sync::Arc,
 };
 use task::{DebugScenario, TcpArgumentsTemplate, ZedDebugConfig};
+use remote::CommandTemplate;
 use util::{archive::extract_zip, rel_path::RelPath};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,6 +199,9 @@ pub struct DebugAdapterBinary {
     pub cwd: Option<PathBuf>,
     pub connection: Option<TcpArguments>,
     pub request_args: StartDebuggingRequestArguments,
+    /// Sidecar process to spawn before the debug adapter.
+    /// Used by Docker connections to forward the DAP TCP port from the container.
+    pub port_forward_command: Option<CommandTemplate>,
 }
 
 impl DebugAdapterBinary {
@@ -224,6 +228,7 @@ impl DebugAdapterBinary {
                 request,
             },
             cwd: binary.cwd.map(|cwd| cwd.into()),
+            port_forward_command: None,
         })
     }
 
@@ -478,6 +483,29 @@ impl DebugAdapter for FakeAdapter {
                 request: self.request_kind(&task_definition.config).await?,
                 configuration: task_definition.config.clone(),
             },
+            port_forward_command: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_adapter_binary_port_forward_command_defaults_to_none() {
+        let binary = DebugAdapterBinary {
+            command: Some("debugpy".to_string()),
+            arguments: vec![],
+            envs: HashMap::default(),
+            cwd: None,
+            connection: None,
+            request_args: StartDebuggingRequestArguments {
+                configuration: serde_json::Value::Null,
+                request: StartDebuggingRequestArgumentsRequest::Launch,
+            },
+            port_forward_command: None,
+        };
+        assert!(binary.port_forward_command.is_none());
     }
 }

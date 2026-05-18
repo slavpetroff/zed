@@ -560,6 +560,7 @@ impl DebugAdapter for GoDebugAdapter {
                 configuration,
                 request: self.request_kind(&task_definition.config).await?,
             },
+            port_forward_command: None,
         })
     }
 }
