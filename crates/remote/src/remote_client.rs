@@ -1510,6 +1510,7 @@ pub struct OpenWslPath {
     pub paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortForwardingMode {
     /// The port forward is baked into the launch command (SSH: adds `-L` flag).
     Inline,
