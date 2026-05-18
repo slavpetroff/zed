@@ -108,16 +108,18 @@ async fn proxy_connection(
         .spawn()
         .context("failed to spawn docker exec for port bridge")?;
 
-    let child_stdin = child.stdin.take().context("docker exec has no stdin")?;
-    let child_stdout = child.stdout.take().context("docker exec has no stdout")?;
+    let mut child_stdin = child.stdin.take().context("docker exec has no stdin")?;
+    let mut child_stdout = child.stdout.take().context("docker exec has no stdout")?;
 
     let (mut tcp_reader, mut tcp_writer) = futures_lite::io::split(tcp_stream);
-    let mut child_stdin = child_stdin;
-    let mut child_stdout = child_stdout;
 
     let tcp_to_container = futures_lite::io::copy(&mut tcp_reader, &mut child_stdin);
     let container_to_tcp = futures_lite::io::copy(&mut child_stdout, &mut tcp_writer);
-    let _ = futures_lite::future::zip(tcp_to_container, container_to_tcp).await;
+
+    // race: when either direction closes, cancel the other to avoid half-close deadlock
+    if let Err(error) = futures_lite::future::race(tcp_to_container, container_to_tcp).await {
+        log::debug!("docker-proxy: connection copy ended: {error}");
+    }
 
     child.kill().ok();
     Ok(())
