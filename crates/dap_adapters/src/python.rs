@@ -34,6 +34,14 @@ pub(crate) struct PythonDebugAdapter {
     debugpy_whl_base_path: OnceCell<Result<Arc<Path>, String>>,
 }
 
+fn venv_creation_commands(base_python: &str) -> Vec<Vec<String>> {
+    vec![
+        vec![base_python.to_string(), "-m".to_string(), "venv".to_string(), "zed_base_venv".to_string()],
+        vec![base_python.to_string(), "-m".to_string(), "virtualenv".to_string(), "zed_base_venv".to_string()],
+        vec!["uv".to_string(), "venv".to_string(), "zed_base_venv".to_string()],
+    ]
+}
+
 impl PythonDebugAdapter {
     const ADAPTER_NAME: &'static str = "Debugpy";
     const DEBUG_ADAPTER_NAME: DebugAdapterName =
@@ -270,35 +278,60 @@ impl PythonDebugAdapter {
                 };
 
                 let debug_adapter_path = paths::debug_adapters_dir().join(Self::DEBUG_ADAPTER_NAME.as_ref());
-                let output = util::command::new_command(&base_python)
-                    .args(["-m", "venv", "zed_base_venv"])
-                    .current_dir(
-                        &debug_adapter_path,
-                    )
-                    .spawn()
-                    .map_err(|e| format!("{e:#?}"))?
-                    .output()
-                    .await
-                    .map_err(|e| format!("{e:#?}"))?;
-
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let debug_adapter_path = debug_adapter_path.display();
-                    return Err(format!("Failed to create base virtual environment with {base_python} in:\n{debug_adapter_path}\nstderr:\n{stderr}\nstdout:\n{stdout}\n"));
-                }
 
                 const PYTHON_PATH: &str = if cfg!(target_os = "windows") {
                     "Scripts/python.exe"
                 } else {
                     "bin/python3"
                 };
-                Ok(Arc::from(
-                    paths::debug_adapters_dir()
-                        .join(Self::DEBUG_ADAPTER_NAME.as_ref())
-                        .join("zed_base_venv")
-                        .join(PYTHON_PATH)
-                        .as_ref(),
+                let venv_python = paths::debug_adapters_dir()
+                    .join(Self::DEBUG_ADAPTER_NAME.as_ref())
+                    .join("zed_base_venv")
+                    .join(PYTHON_PATH);
+
+                let commands = venv_creation_commands(&base_python);
+                let mut last_error = String::new();
+
+                for cmd_parts in &commands {
+                    let (program, args) = cmd_parts.split_first().expect("command must be non-empty");
+                    let output = util::command::new_command(program)
+                        .args(args)
+                        .current_dir(&debug_adapter_path)
+                        .spawn()
+                        .map_err(|e| format!("{e:#?}"))?
+                        .output()
+                        .await
+                        .map_err(|e| format!("{e:#?}"))?;
+
+                    if output.status.success() {
+                        if venv_python.exists() {
+                            return Ok(Arc::from(venv_python.as_ref()));
+                        }
+                        last_error = format!(
+                            "'{}' succeeded but {} was not created",
+                            cmd_parts.join(" "),
+                            venv_python.display()
+                        );
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        last_error = format!(
+                            "'{}' failed:\nstderr: {stderr}\nstdout: {stdout}",
+                            cmd_parts.join(" ")
+                        );
+                    }
+                }
+
+                Err(format!(
+                    "Failed to create Python virtual environment for debugpy.\n\
+                     Tried in {}:\n{}\nLast error: {}\n\n\
+                     Fix options:\n\
+                     - apt-get install python3-venv (Debian/Ubuntu)\n\
+                     - pip install virtualenv\n\
+                     - Install uv: https://github.com/astral-sh/uv",
+                    debug_adapter_path.display(),
+                    commands.iter().map(|c| format!("  - {}", c.join(" "))).collect::<Vec<_>>().join("\n"),
+                    last_error
                 ))
             })
             .await
@@ -919,6 +952,20 @@ impl DebugAdapter for PythonDebugAdapter {
             .as_str()
             .filter(|label| !label.is_empty())?;
         Some(label.to_owned())
+    }
+}
+
+#[cfg(test)]
+mod venv_tests {
+    use super::*;
+
+    #[test]
+    fn venv_creation_commands_sequence() {
+        let sequence = venv_creation_commands("python3");
+        assert_eq!(sequence.len(), 3);
+        assert_eq!(sequence[0], vec!["python3", "-m", "venv", "zed_base_venv"]);
+        assert_eq!(sequence[1], vec!["python3", "-m", "virtualenv", "zed_base_venv"]);
+        assert_eq!(sequence[2], vec!["uv", "venv", "zed_base_venv"]);
     }
 }
 
