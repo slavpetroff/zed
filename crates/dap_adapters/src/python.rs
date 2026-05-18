@@ -293,15 +293,26 @@ impl PythonDebugAdapter {
                 let mut last_error = String::new();
 
                 for cmd_parts in &commands {
-                    let (program, args) = cmd_parts.split_first().expect("command must be non-empty");
-                    let output = util::command::new_command(program)
+                    let Some((program, args)) = cmd_parts.split_first() else {
+                        continue;
+                    };
+                    let spawn_result = util::command::new_command(program)
                         .args(args)
                         .current_dir(&debug_adapter_path)
-                        .spawn()
-                        .map_err(|e| format!("{e:#?}"))?
-                        .output()
-                        .await
-                        .map_err(|e| format!("{e:#?}"))?;
+                        .spawn();
+                    let output = match spawn_result {
+                        Ok(child) => match child.output().await {
+                            Ok(out) => out,
+                            Err(e) => {
+                                last_error = format!("'{}' failed to run: {e:#}", cmd_parts.join(" "));
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            last_error = format!("'{}' could not be started: {e:#}", cmd_parts.join(" "));
+                            continue;
+                        }
+                    };
 
                     if output.status.success() {
                         if venv_python.exists() {
