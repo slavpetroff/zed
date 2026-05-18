@@ -23,8 +23,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use task::{DebugScenario, TcpArgumentsTemplate, ZedDebugConfig};
 use remote::CommandTemplate;
+use task::{DebugScenario, TcpArgumentsTemplate, ZedDebugConfig};
 use util::{archive::extract_zip, rel_path::RelPath};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
