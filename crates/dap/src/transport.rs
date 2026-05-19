@@ -636,6 +636,7 @@ impl Transport for TcpTransport {
         let timeout = self.timeout;
         let address = SocketAddr::new(self.host, self.port);
         let process = self.process.clone();
+        let is_docker = self.port_forward_process.is_some();
         executor.clone().spawn(async move {
             select! {
                 _ = executor.timer(Duration::from_millis(timeout)).fuse() => {
@@ -653,14 +654,21 @@ impl Transport for TcpTransport {
                                 if has_process {
                                     let status = process.lock().as_mut().unwrap().try_status();
                                     if let Ok(Some(_)) = status {
-                                        let process = process.lock().take().unwrap().into_inner();
-                                        let output = process.output().await?;
-                                        let output = if output.stderr.is_empty() {
-                                            String::from_utf8_lossy(&output.stdout).to_string()
+                                        // stdout/stderr were already piped into log tasks in
+                                        // start(), so they are None on the child here.
+                                        // Drop the child to reap the process and bail immediately
+                                        // (avoids hanging on output().await with taken pipes).
+                                        drop(process.lock().take());
+                                        let hint = if is_docker {
+                                            "\nhint: devcontainer debugging requires \
+                                             /bin/sh in the target container"
                                         } else {
-                                            String::from_utf8_lossy(&output.stderr).to_string()
+                                            ""
                                         };
-                                        anyhow::bail!("{output}\nerror: process exited before debugger attached.");
+                                        anyhow::bail!(
+                                            "error: process exited before \
+                                             debugger attached.{hint}"
+                                        );
                                     }
                                 }
 
@@ -1209,6 +1217,70 @@ mod tests {
         assert!(
             !transport.has_adapter_stdin(),
             "non-docker adapter must keep Stdio::null() stdin (no handle)"
+        );
+    }
+
+    fn exiting_adapter_binary(
+        port_forward_command: Option<CommandTemplate>,
+    ) -> DebugAdapterBinary {
+        let mut binary =
+            binary_with_command_and_sidecar(Some("/bin/sh".to_string()), port_forward_command);
+        binary.arguments = vec!["-c".to_string(), "exit 1".to_string()];
+        // Use a long timeout so the outer timer never fires before the process-exit
+        // branch detects that the adapter exited (which happens on the first connect
+        // attempt, well within 10 s).
+        if let Some(ref mut conn) = binary.connection {
+            conn.timeout = Some(10_000);
+        }
+        binary
+    }
+
+    #[gpui::test]
+    async fn connect_failure_on_docker_path_hints_at_sh_requirement(
+        cx: &mut TestAppContext,
+    ) {
+        let binary = exiting_adapter_binary(Some(CommandTemplate {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "".to_string()],
+            env: Default::default(),
+        }));
+
+        let mut async_cx = cx.to_async();
+        let mut transport = TcpTransport::start(&binary, Default::default(), &mut async_cx)
+            .await
+            .unwrap();
+
+        // allow_parking lets real async I/O (TCP connect, process wait) complete instead
+        // of the test scheduler fast-forwarding the simulated clock past the timeout timer.
+        cx.background_executor.allow_parking();
+        let err = match transport.connect().await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("connect must fail when adapter exits immediately"),
+        };
+        assert!(
+            err.contains("/bin/sh in the target container"),
+            "docker connect failure must hint at the sh requirement: {err}"
+        );
+    }
+
+    #[gpui::test]
+    async fn connect_failure_without_forwarding_has_no_sh_hint(cx: &mut TestAppContext) {
+        let binary = exiting_adapter_binary(None);
+
+        let mut async_cx = cx.to_async();
+        let mut transport = TcpTransport::start(&binary, Default::default(), &mut async_cx)
+            .await
+            .unwrap();
+
+        // allow_parking lets real async I/O complete instead of fast-forwarding the clock.
+        cx.background_executor.allow_parking();
+        let err = match transport.connect().await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("connect must fail when adapter exits immediately"),
+        };
+        assert!(
+            !err.contains("/bin/sh in the target container"),
+            "non-docker failure must not add the docker sh hint: {err}"
         );
     }
 }
