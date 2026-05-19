@@ -982,10 +982,58 @@ mod venv_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
     use util::path;
 
     use super::*;
     use task::TcpArgumentsTemplate;
+
+    // Verifies the contract between the Python adapter and dap_store for Docker devcontainers:
+    // the adapter sets `connection` (so dap_store can route traffic) and leaves
+    // `port_forward_command = None` (dap_store injects the sidecar for Docker).
+    #[gpui::test]
+    async fn get_installed_binary_sets_tcp_connection_for_django_attach() {
+        let adapter = PythonDebugAdapter {
+            base_venv_path: OnceCell::new(),
+            debugpy_whl_base_path: OnceCell::new(),
+        };
+
+        let config = serde_json::json!({
+            "request": "attach",
+            "connect": { "host": "127.0.0.1", "port": 5678 }
+        });
+
+        let task_def = DebugTaskDefinition {
+            label: "django debug".into(),
+            adapter: PythonDebugAdapter::ADAPTER_NAME.into(),
+            config,
+            tcp_connection: None,
+        };
+
+        let result = adapter
+            .get_installed_binary(
+                &test_mocks::MockDelegate::new(),
+                &task_def,
+                None,
+                None,
+                None,
+                Some("python3".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let conn = result
+            .connection
+            .expect("connection must be set so dap_store can apply Docker port-forward routing");
+        assert_eq!(conn.port, 5678);
+        assert_eq!(conn.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        assert!(
+            result.port_forward_command.is_none(),
+            "adapter must not set port_forward_command; dap_store injects it for Docker"
+        );
+        assert!(result.command.is_some(), "debugpy command path must be set");
+    }
 
     #[gpui::test]
     async fn test_tcp_connection_conflict_with_connect_args() {

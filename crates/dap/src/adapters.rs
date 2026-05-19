@@ -491,6 +491,7 @@ impl DebugAdapter for FakeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn debug_adapter_binary_port_forward_command_defaults_to_none() {
@@ -507,5 +508,39 @@ mod tests {
             port_forward_command: None,
         };
         assert!(binary.port_forward_command.is_none());
+    }
+
+    // The `connection` field carries the container's TCP address from the upstream server to the
+    // client. The client's dap_store reads it to build the port-forward sidecar for Docker. If
+    // this round-trip breaks, Docker devcontainer DAP silently falls back to no forwarding.
+    #[test]
+    fn debug_adapter_binary_connection_survives_proto_round_trip() {
+        let original = DebugAdapterBinary {
+            command: Some("debugpy".to_string()),
+            arguments: vec!["connect".to_string(), "5678".to_string()],
+            envs: HashMap::default(),
+            cwd: None,
+            connection: Some(TcpArguments {
+                host: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                port: 5678,
+                timeout: Some(2000),
+            }),
+            request_args: StartDebuggingRequestArguments {
+                configuration: serde_json::json!({"request": "attach"}),
+                request: StartDebuggingRequestArgumentsRequest::Attach,
+            },
+            port_forward_command: None,
+        };
+
+        let round_tripped = DebugAdapterBinary::from_proto(original.to_proto()).unwrap();
+
+        let conn = round_tripped
+            .connection
+            .expect("connection must survive proto round-trip for devcontainer DAP to work");
+        assert_eq!(conn.port, 5678);
+        assert_eq!(conn.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(conn.timeout, Some(2000));
+        // port_forward_command is client-side only and must never appear in the proto
+        assert!(round_tripped.port_forward_command.is_none());
     }
 }

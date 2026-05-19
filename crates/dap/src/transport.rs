@@ -1040,12 +1040,83 @@ impl Transport for FakeTransport {
 }
 
 #[cfg(test)]
+impl TcpTransport {
+    fn has_port_forward_sidecar(&self) -> bool {
+        self.port_forward_process.is_some()
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    #[test]
-    fn tcp_transport_struct_has_port_forward_process_field() {
-        // Structural compile-time test: port_forward_process field exists on TcpTransport.
-        // The real sidecar behavior is exercised by the full integration in dap_store (Task 7).
-        // This test just ensures the struct compiles with the new field.
-        assert!(true);
+    use super::*;
+    use crate::adapters::{StartDebuggingRequestArguments, StartDebuggingRequestArgumentsRequest};
+    use gpui::TestAppContext;
+    use remote::CommandTemplate;
+
+    fn binary_with_sidecar(port_forward_command: Option<CommandTemplate>) -> DebugAdapterBinary {
+        DebugAdapterBinary {
+            command: None,
+            arguments: vec![],
+            envs: Default::default(),
+            cwd: None,
+            connection: Some(TcpArguments {
+                host: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 9999,
+                timeout: Some(100),
+            }),
+            request_args: StartDebuggingRequestArguments {
+                configuration: serde_json::Value::Null,
+                request: StartDebuggingRequestArgumentsRequest::Attach,
+            },
+            port_forward_command,
+        }
+    }
+
+    // TcpTransport::start() is normally bypassed by FakeTransport in test builds.
+    // These tests call it directly to verify the sidecar spawn/kill path that
+    // FakeTransport never exercises.
+    #[gpui::test]
+    async fn tcp_transport_spawns_port_forward_sidecar(cx: &mut TestAppContext) {
+        let binary = binary_with_sidecar(Some(CommandTemplate {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "".to_string()],
+            env: Default::default(),
+        }));
+
+        let mut async_cx = cx.to_async();
+        let mut transport =
+            TcpTransport::start(&binary, Default::default(), &mut async_cx)
+                .await
+                .unwrap();
+
+        assert!(
+            transport.has_port_forward_sidecar(),
+            "port_forward_process must be Some when port_forward_command is provided"
+        );
+
+        transport.kill();
+
+        assert!(
+            !transport.has_port_forward_sidecar(),
+            "port_forward_process must be None after kill()"
+        );
+    }
+
+    #[gpui::test]
+    async fn tcp_transport_no_sidecar_when_port_forward_command_is_none(
+        cx: &mut TestAppContext,
+    ) {
+        let binary = binary_with_sidecar(None);
+
+        let mut async_cx = cx.to_async();
+        let transport =
+            TcpTransport::start(&binary, Default::default(), &mut async_cx)
+                .await
+                .unwrap();
+
+        assert!(
+            !transport.has_port_forward_sidecar(),
+            "port_forward_process must be None when no port_forward_command is given"
+        );
     }
 }

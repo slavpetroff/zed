@@ -869,24 +869,75 @@ impl RemoteConnection for DockerExecConnection {
 
 #[cfg(test)]
 mod port_forwarding_mode_tests {
+    use super::*;
     use crate::remote_client::PortForwardingMode;
 
-    #[test]
-    fn docker_returns_separate() {
-        assert!(matches!(PortForwardingMode::Separate, PortForwardingMode::Separate));
+    fn make_test_docker_connection(container_id: &str) -> DockerExecConnection {
+        DockerExecConnection {
+            proxy_process: parking_lot::Mutex::new(None),
+            remote_dir_for_server: "/home/vscode".to_string(),
+            remote_binary_relpath: None,
+            connection_options: DockerConnectionOptions {
+                name: "test".to_string(),
+                container_id: container_id.to_string(),
+                remote_user: "vscode".to_string(),
+                upload_binary_over_docker_exec: false,
+                use_podman: false,
+                remote_env: Default::default(),
+            },
+            remote_platform: None,
+            path_style: None,
+            shell: "bash".to_string(),
+        }
     }
 
     #[test]
-    fn forward_ports_command_has_correct_arg_structure() {
-        // Verify that build_forward_ports_command produces --docker-proxy-forward args
-        // in the format that docker_proxy::parse_forward_spec consumes.
-        let local_port = 54321u16;
-        let remote_host = "127.0.0.1";
-        let remote_port = 5678u16;
-        let forward_arg = format!("{local_port}:{remote_host}:{remote_port}");
-        let parsed = docker_proxy::parse_forward_spec(&forward_arg).unwrap();
-        assert_eq!(parsed.local_port, local_port);
-        assert_eq!(parsed.remote_host, remote_host);
-        assert_eq!(parsed.remote_port, remote_port);
+    fn docker_returns_separate_not_inline() {
+        let conn = make_test_docker_connection("abc123");
+        // Must be Separate so dap_store builds a sidecar instead of inline port-forwarding.
+        assert!(matches!(conn.port_forwarding_mode(), PortForwardingMode::Separate));
+    }
+
+    #[test]
+    fn build_forward_ports_command_produces_docker_proxy_args() {
+        let conn = make_test_docker_connection("mycontainer456");
+        let cmd = conn
+            .build_forward_ports_command(vec![(54321, "127.0.0.1".to_string(), 5678)])
+            .unwrap();
+
+        assert!(cmd.args.contains(&"--docker-proxy".to_string()));
+        assert!(cmd.args.contains(&"--docker-cli".to_string()));
+        assert!(cmd.args.contains(&"--container".to_string()));
+        assert!(cmd.args.contains(&"mycontainer456".to_string()));
+
+        // The forward arg must be parseable by docker_proxy::parse_forward_spec
+        let forward_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "--docker-proxy-forward")
+            .expect("--docker-proxy-forward arg must be present");
+        let forward_arg = &cmd.args[forward_idx + 1];
+        let parsed = docker_proxy::parse_forward_spec(forward_arg).unwrap();
+        assert_eq!(parsed.local_port, 54321);
+        assert_eq!(parsed.remote_host, "127.0.0.1");
+        assert_eq!(parsed.remote_port, 5678);
+    }
+
+    #[test]
+    fn build_forward_ports_command_handles_multiple_forwards() {
+        let conn = make_test_docker_connection("multi");
+        let cmd = conn
+            .build_forward_ports_command(vec![
+                (8000, "127.0.0.1".to_string(), 8000),
+                (5678, "127.0.0.1".to_string(), 5678),
+            ])
+            .unwrap();
+
+        let forward_count = cmd
+            .args
+            .iter()
+            .filter(|a| a.as_str() == "--docker-proxy-forward")
+            .count();
+        assert_eq!(forward_count, 2, "one --docker-proxy-forward per port");
     }
 }
