@@ -96,7 +96,7 @@ impl Display for DevContainerError {
             "{}",
             match self {
                 DevContainerError::DockerNotAvailable =>
-                    "docker CLI not found on $PATH".to_string(),
+                    "No running container runtime found. Ensure Docker or Podman is installed and the daemon is running.".to_string(),
                 DevContainerError::ContainerNotValid(id) => format!(
                     "docker image {id} did not have expected configuration for a dev container"
                 ),
@@ -295,8 +295,13 @@ pub async fn start_dev_container_with_config(
             remote_env,
             ..
         }) => {
-            let parsed_config =
-                read_devcontainer_configuration(actual_config, &context, environment, runtime.clone()).await;
+            let parsed_config = read_devcontainer_configuration(
+                actual_config,
+                &context,
+                environment,
+                runtime.clone(),
+            )
+            .await;
 
             let project_name = match &parsed_config {
                 Ok(DevContainer {
