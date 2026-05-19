@@ -136,8 +136,9 @@ pub(crate) async fn read_default_devcontainer_configuration(
     environment: HashMap<String, String>,
 ) -> Result<DevContainer, DevContainerError> {
     let default_config = DevContainerConfig::default_config();
+    let runtime = resolve_container_cli(cx.container_runtime.clone()).await?;
 
-    read_devcontainer_configuration(default_config, cx, environment)
+    read_devcontainer_configuration(default_config, cx, environment, runtime)
         .await
         .map_err(|e| {
             log::error!("Default configuration not found: {:?}", e);
@@ -271,7 +272,7 @@ pub async fn start_dev_container_with_config(
     config: Option<DevContainerConfig>,
     environment: HashMap<String, String>,
 ) -> Result<(DevContainerConnection, String), DevContainerError> {
-    check_for_docker(context.use_podman).await?;
+    let runtime = resolve_container_cli(context.container_runtime.clone()).await?;
 
     let Some(actual_config) = config.clone() else {
         return Err(DevContainerError::NotInValidProject);
@@ -282,6 +283,7 @@ pub async fn start_dev_container_with_config(
         environment.clone(),
         actual_config.clone(),
         context.project_directory.clone().as_ref(),
+        runtime.clone(),
     )
     .await
     {
@@ -294,7 +296,7 @@ pub async fn start_dev_container_with_config(
             ..
         }) => {
             let parsed_config =
-                read_devcontainer_configuration(actual_config, &context, environment).await;
+                read_devcontainer_configuration(actual_config, &context, environment, runtime.clone()).await;
 
             let project_name = match &parsed_config {
                 Ok(DevContainer {
@@ -306,7 +308,7 @@ pub async fn start_dev_container_with_config(
             let connection = DevContainerConnection {
                 name: project_name,
                 container_id: container_id.clone(),
-                use_podman: context.use_podman,
+                use_podman: runtime == ContainerRuntime::Podman,
                 remote_user,
                 extension_ids,
                 remote_env: remote_env.into_iter().collect(),
@@ -324,7 +326,7 @@ pub async fn start_dev_container_with_config(
                         log::error!("devcontainer: cannot start port forwarding: {e:#}");
                     }
                     Ok(current_exe) => {
-                        let docker_cli = if context.use_podman { "podman" } else { "docker" };
+                        let docker_cli = runtime.cli_name();
                         let mut args = vec![
                             "--docker-proxy".to_string(),
                             "--docker-cli".to_string(),

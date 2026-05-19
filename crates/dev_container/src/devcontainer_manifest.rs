@@ -13,7 +13,7 @@ use http_client::HttpClient;
 use util::{ResultExt, command::Command, normalize_path};
 
 use crate::{
-    DevContainerConfig, DevContainerContext,
+    ContainerRuntime, DevContainerConfig, DevContainerContext,
     command_json::{CommandRunner, DefaultCommandRunner},
     devcontainer_api::{DevContainerError, DevContainerUp},
     devcontainer_json::{
@@ -2289,12 +2289,9 @@ pub(crate) async fn read_devcontainer_configuration(
     config: DevContainerConfig,
     context: &DevContainerContext,
     environment: HashMap<String, String>,
+    runtime: ContainerRuntime,
 ) -> Result<DevContainer, DevContainerError> {
-    let docker = if context.use_podman {
-        Docker::new("podman").await
-    } else {
-        Docker::new("docker").await
-    };
+    let docker = Docker::new(runtime).await;
     let mut dev_container = DevContainerManifest::new(
         context,
         environment,
@@ -2313,12 +2310,9 @@ pub(crate) async fn spawn_dev_container(
     environment: HashMap<String, String>,
     config: DevContainerConfig,
     local_project_path: &Path,
+    runtime: ContainerRuntime,
 ) -> Result<DevContainerUp, DevContainerError> {
-    let docker = if context.use_podman {
-        Docker::new("podman").await
-    } else {
-        Docker::new("docker").await
-    };
+    let docker = Docker::new(runtime).await;
     let mut devcontainer_manifest = DevContainerManifest::new(
         context,
         environment,
@@ -2824,6 +2818,7 @@ mod test {
         worktree_store::{WorktreeIdCounter, WorktreeStore},
     };
     use serde_json_lenient::Value;
+    use settings::ContainerRuntimeHint;
     use util::{command::Command, paths::SanitizedPath};
 
     #[cfg(not(target_os = "windows"))]
@@ -2949,7 +2944,7 @@ mod test {
 
         let context = DevContainerContext {
             project_directory: SanitizedPath::cast_arc(project_path),
-            use_podman: false,
+            container_runtime: ContainerRuntimeHint::Auto,
             fs: fs.clone(),
             http_client: http_client.clone(),
             environment: project_environment.downgrade(),
