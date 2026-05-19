@@ -9,6 +9,7 @@ use http_client::anyhow;
 use picker::Picker;
 use picker::PickerDelegate;
 use project::ProjectEnvironment;
+use settings::ContainerRuntimeHint;
 use settings::RegisterSetting;
 use settings::Settings;
 use std::collections::HashMap;
@@ -95,9 +96,24 @@ fn get_safe_id(input: &str) -> String {
     result
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContainerRuntime {
+    Docker,
+    Podman,
+}
+
+impl ContainerRuntime {
+    pub fn cli_name(&self) -> &'static str {
+        match self {
+            ContainerRuntime::Docker => "docker",
+            ContainerRuntime::Podman => "podman",
+        }
+    }
+}
+
 pub struct DevContainerContext {
     pub project_directory: Arc<Path>,
-    pub use_podman: bool,
+    pub container_runtime: ContainerRuntimeHint,
     pub fs: Arc<dyn Fs>,
     pub http_client: Arc<dyn HttpClient>,
     pub environment: WeakEntity<ProjectEnvironment>,
@@ -106,13 +122,13 @@ pub struct DevContainerContext {
 impl DevContainerContext {
     pub fn from_workspace(workspace: &Workspace, cx: &App) -> Option<Self> {
         let project_directory = workspace.project().read(cx).active_project_directory(cx)?;
-        let use_podman = DevContainerSettings::get_global(cx).use_podman;
+        let container_runtime = DevContainerSettings::get_global(cx).container_runtime.clone();
         let http_client = cx.http_client().clone();
         let fs = workspace.app_state().fs.clone();
         let environment = workspace.project().read(cx).environment().downgrade();
         Some(Self {
             project_directory,
-            use_podman,
+            container_runtime,
             fs,
             http_client,
             environment,
@@ -133,17 +149,31 @@ impl DevContainerContext {
 
 #[derive(RegisterSetting)]
 struct DevContainerSettings {
-    use_podman: bool,
+    container_runtime: ContainerRuntimeHint,
 }
 
-pub fn use_podman(cx: &App) -> bool {
-    DevContainerSettings::get_global(cx).use_podman
+impl DevContainerSettings {
+    pub(crate) fn resolve_runtime(
+        explicit: Option<ContainerRuntimeHint>,
+        use_podman: Option<bool>,
+    ) -> ContainerRuntimeHint {
+        if let Some(hint) = explicit {
+            return hint;
+        }
+        match use_podman {
+            Some(true) => ContainerRuntimeHint::Podman,
+            _ => ContainerRuntimeHint::Auto,
+        }
+    }
 }
 
 impl Settings for DevContainerSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         Self {
-            use_podman: content.remote.use_podman.unwrap_or(false),
+            container_runtime: Self::resolve_runtime(
+                content.remote.container_runtime.clone(),
+                content.remote.use_podman,
+            ),
         }
     }
 }
@@ -1671,6 +1701,44 @@ async fn get_ghcr_features(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn container_runtime_cli_names() {
+        assert_eq!(ContainerRuntime::Docker.cli_name(), "docker");
+        assert_eq!(ContainerRuntime::Podman.cli_name(), "podman");
+    }
+
+    #[test]
+    fn resolve_hint_container_runtime_takes_precedence() {
+        let runtime = DevContainerSettings::resolve_runtime(
+            Some(ContainerRuntimeHint::Docker),
+            None,
+        );
+        assert_eq!(runtime, ContainerRuntimeHint::Docker);
+    }
+
+    #[test]
+    fn resolve_hint_use_podman_true_maps_to_podman() {
+        let runtime = DevContainerSettings::resolve_runtime(None, Some(true));
+        assert_eq!(runtime, ContainerRuntimeHint::Podman);
+    }
+
+    #[test]
+    fn resolve_hint_use_podman_false_maps_to_auto() {
+        let runtime = DevContainerSettings::resolve_runtime(None, Some(false));
+        assert_eq!(runtime, ContainerRuntimeHint::Auto);
+    }
+
+    #[test]
+    fn resolve_hint_defaults_to_auto() {
+        let runtime = DevContainerSettings::resolve_runtime(None, None);
+        assert_eq!(runtime, ContainerRuntimeHint::Auto);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
     use http_client::{FakeHttpClient, anyhow};
 
     use crate::{
