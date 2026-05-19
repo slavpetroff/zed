@@ -30,12 +30,11 @@ pub fn main(docker_cli: &str, container_id: &str, forwards: &[ForwardSpec]) -> R
         let mut listener_tasks = Vec::new();
 
         for spec in forwards {
-            let listener =
-                smol::net::TcpListener::bind(format!("127.0.0.1:{}", spec.local_port))
-                    .await
-                    .with_context(|| {
-                        format!("docker-proxy: port {} already in use", spec.local_port)
-                    })?;
+            let listener = smol::net::TcpListener::bind(format!("127.0.0.1:{}", spec.local_port))
+                .await
+                .with_context(|| {
+                    format!("docker-proxy: port {} already in use", spec.local_port)
+                })?;
             log::info!(
                 "docker-proxy: listening on 127.0.0.1:{} → {}:{}",
                 spec.local_port,
@@ -87,6 +86,23 @@ pub fn main(docker_cli: &str, container_id: &str, forwards: &[ForwardSpec]) -> R
     })
 }
 
+// The bridge is a pure byte-pump. Adapter lifetime is owned by the adapter's
+// own `docker exec` stdin lifeline (see
+// docs/superpowers/specs/2026-05-19-devcontainer-dap-adapter-lifeline-design.md):
+// the in-container adapter reaps itself on stdin-EOF, so the bridge never kills
+// anything. It keeps a bounded connect-retry loop because the proxy may accept
+// the local TCP connection slightly before the in-container adapter has bound
+// its port. It drives its lifetime off stdin-EOF (`cat >&3` returns when Zed
+// disconnects) rather than `wait`, which would block forever on the
+// never-closing socket-side `cat`.
+fn build_bridge_command(remote_host: &str, remote_port: u16) -> String {
+    format!(
+        "i=0; until exec 3<>/dev/tcp/{remote_host}/{remote_port} 2>/dev/null; \
+         do i=$((i+1)); [ $i -ge 100 ] && exit 1; sleep 0.1; done; \
+         cat <&3 & cat >&3"
+    )
+}
+
 async fn proxy_connection(
     tcp_stream: smol::net::TcpStream,
     docker_cli: &str,
@@ -96,9 +112,7 @@ async fn proxy_connection(
 ) -> Result<()> {
     use smol::process::{Command, Stdio};
 
-    let bridge_cmd = format!(
-        "exec 3<>/dev/tcp/{remote_host}/{remote_port}; cat <&3 & cat >&3; wait"
-    );
+    let bridge_cmd = build_bridge_command(remote_host, remote_port);
 
     let mut child = Command::new(docker_cli)
         .args(["exec", "-i", container_id, "bash", "-c", &bridge_cmd])
@@ -160,5 +174,40 @@ mod tests {
     #[test]
     fn rejects_remote_port_out_of_range() {
         assert!(parse_forward_spec("54321:127.0.0.1:99999").is_err());
+    }
+
+    #[test]
+    fn bridge_command_retries_until_remote_port_is_ready() {
+        let cmd = build_bridge_command("127.0.0.1", 37095);
+        assert!(
+            cmd.contains("until exec 3<>/dev/tcp/127.0.0.1/37095 2>/dev/null"),
+            "bridge must keep the connect-retry loop: {cmd}"
+        );
+        assert!(
+            cmd.contains("[ $i -ge 100 ] && exit 1"),
+            "bridge must bound the retry loop: {cmd}"
+        );
+    }
+
+    #[test]
+    fn bridge_command_is_pure_pump() {
+        let cmd = build_bridge_command("127.0.0.1", 5678);
+        // No reaper machinery of any kind — adapter lifetime is owned by the
+        // adapter's own docker exec stdin lifeline, not the bridge.
+        assert!(!cmd.contains("reap"), "no reaper: {cmd}");
+        assert!(!cmd.contains("trap"), "no trap: {cmd}");
+        assert!(!cmd.contains("/proc"), "no /proc scan: {cmd}");
+        assert!(!cmd.contains("targets"), "no pid snapshot: {cmd}");
+        assert!(!cmd.contains("kill"), "bridge must not kill anything: {cmd}");
+        // Retains the bounded connect-retry loop.
+        assert!(
+            cmd.contains("until exec 3<>/dev/tcp/127.0.0.1/5678 2>/dev/null"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("[ $i -ge 100 ] && exit 1"), "{cmd}");
+        // Half-close fix: background socket->stdout, foreground stdin->socket,
+        // never `wait` (which blocks forever on the never-closing socket cat).
+        assert!(cmd.contains("cat <&3 & cat >&3"), "{cmd}");
+        assert!(!cmd.contains("; wait"), "must not block on wait: {cmd}");
     }
 }
