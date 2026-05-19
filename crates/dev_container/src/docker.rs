@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use util::command::Command;
 
 use crate::{
+    ContainerRuntime,
     command_json::evaluate_json_command, devcontainer_api::DevContainerError,
     devcontainer_json::MountDefinition,
 };
@@ -174,7 +175,7 @@ pub(crate) struct DockerComposeConfig {
 }
 
 pub(crate) struct Docker {
-    docker_cli: String,
+    runtime: ContainerRuntime,
     has_buildx: bool,
 }
 
@@ -185,33 +186,31 @@ impl DockerInspect {
 }
 
 impl Docker {
-    pub(crate) async fn new(docker_cli: &str) -> Self {
-        let has_buildx = if docker_cli == "podman" {
-            false
-        } else {
-            let output = Command::new(docker_cli)
-                .args(["buildx", "version"])
-                .output()
-                .await;
-            output.map(|o| o.status.success()).unwrap_or(false)
+    pub(crate) async fn new(runtime: ContainerRuntime) -> Self {
+        let has_buildx = match &runtime {
+            ContainerRuntime::Podman => false,
+            ContainerRuntime::Docker => {
+                let output = Command::new("docker")
+                    .args(["buildx", "version"])
+                    .output()
+                    .await;
+                output.map(|o| o.status.success()).unwrap_or(false)
+            }
         };
-        if !has_buildx && docker_cli != "podman" {
+        if !has_buildx && runtime == ContainerRuntime::Docker {
             log::info!(
                 "docker buildx not found; dev container builds will use the scratch-image fallback"
             );
         }
-        Self {
-            docker_cli: docker_cli.to_string(),
-            has_buildx,
-        }
+        Self { runtime, has_buildx }
     }
 
     fn is_podman(&self) -> bool {
-        self.docker_cli == "podman"
+        self.runtime == ContainerRuntime::Podman
     }
 
     async fn pull_image(&self, image: &String) -> Result<(), DevContainerError> {
-        let mut command = Command::new(&self.docker_cli);
+        let mut command = Command::new(&self.docker_cli());
         command.args(&["pull", "--", image]);
 
         let output = command.output().await.map_err(|e| {
@@ -228,7 +227,7 @@ impl Docker {
     }
 
     fn create_docker_query_containers(&self, filters: Vec<String>) -> Command {
-        let mut command = Command::new(&self.docker_cli);
+        let mut command = Command::new(&self.docker_cli());
         command.args(&["ps", "-a"]);
 
         for filter in filters {
@@ -240,13 +239,13 @@ impl Docker {
     }
 
     fn create_docker_inspect(&self, id: &str) -> Command {
-        let mut command = Command::new(&self.docker_cli);
+        let mut command = Command::new(&self.docker_cli());
         command.args(&["inspect", "--format={{json . }}", id]);
         command
     }
 
     fn create_docker_compose_config_command(&self, config_files: &Vec<PathBuf>) -> Command {
-        let mut command = Command::new(&self.docker_cli);
+        let mut command = Command::new(&self.docker_cli());
         command.arg("compose");
         for file_path in config_files {
             command.args(&["-f", &file_path.display().to_string()]);
@@ -267,7 +266,7 @@ impl DockerClient for Docker {
         let Some(docker_inspect): Option<DockerInspect> = evaluate_json_command(command).await?
         else {
             log::error!("Docker inspect produced no deserializable output");
-            return Err(DevContainerError::CommandFailed(self.docker_cli.clone()));
+            return Err(DevContainerError::CommandFailed(self.docker_cli()));
         };
         Ok(docker_inspect)
     }
@@ -285,7 +284,7 @@ impl DockerClient for Docker {
         config_files: &Vec<PathBuf>,
         project_name: &str,
     ) -> Result<(), DevContainerError> {
-        let mut command = Command::new(&self.docker_cli);
+        let mut command = Command::new(&self.docker_cli());
         if !self.is_podman() {
             command.env("DOCKER_BUILDKIT", "1");
         }
@@ -318,7 +317,7 @@ impl DockerClient for Docker {
         env: &HashMap<String, String>,
         inner_command: Command,
     ) -> Result<(), DevContainerError> {
-        let mut command = Command::new(&self.docker_cli);
+        let mut command = Command::new(&self.docker_cli());
 
         command.args(&["exec", "-w", remote_folder, "-u", user]);
 
@@ -355,7 +354,7 @@ impl DockerClient for Docker {
         Ok(())
     }
     async fn start_container(&self, id: &str) -> Result<(), DevContainerError> {
-        let mut command = Command::new(&self.docker_cli);
+        let mut command = Command::new(&self.docker_cli());
 
         command.args(&["start", id]);
 
@@ -404,7 +403,7 @@ impl DockerClient for Docker {
     }
 
     fn docker_cli(&self) -> String {
-        self.docker_cli.clone()
+        self.runtime.cli_name().to_string()
     }
 
     fn supports_compose_buildkit(&self) -> bool {
@@ -578,6 +577,7 @@ mod test {
     };
 
     use crate::{
+        ContainerRuntime,
         command_json::deserialize_json_output,
         devcontainer_api::DevContainerError,
         devcontainer_json::MountDefinition,
@@ -668,7 +668,7 @@ mod test {
     #[test]
     fn should_create_docker_inspect_command() {
         let docker = Docker {
-            docker_cli: "docker".to_string(),
+            runtime: ContainerRuntime::Docker,
             has_buildx: false,
         };
         let given_id = "given_docker_id";
