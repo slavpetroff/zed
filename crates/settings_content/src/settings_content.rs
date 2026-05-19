@@ -1132,6 +1132,21 @@ pub enum ImageFileSizeUnit {
     Decimal,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerRuntimeHint {
+    #[default]
+    Auto,
+    Docker,
+    Podman,
+}
+
+impl merge_from::MergeFrom for ContainerRuntimeHint {
+    fn merge_from(&mut self, other: &Self) {
+        *self = other.clone();
+    }
+}
+
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
 pub struct RemoteSettingsContent {
@@ -1140,6 +1155,7 @@ pub struct RemoteSettingsContent {
     pub dev_container_connections: Option<Vec<DevContainerConnection>>,
     pub read_ssh_config: Option<bool>,
     pub use_podman: Option<bool>,
+    pub container_runtime: Option<ContainerRuntimeHint>,
 }
 
 #[with_fallible_options]
@@ -1327,5 +1343,32 @@ impl From<u64> for DelayMs {
 impl std::fmt::Display for DelayMs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}ms", self.0)
+    }
+}
+
+#[cfg(test)]
+mod container_runtime_hint_tests {
+    use super::*;
+
+    #[test]
+    fn container_runtime_hint_serde_round_trip() {
+        let cases = [
+            (ContainerRuntimeHint::Auto, "\"auto\""),
+            (ContainerRuntimeHint::Docker, "\"docker\""),
+            (ContainerRuntimeHint::Podman, "\"podman\""),
+        ];
+        for (hint, expected_json) in cases {
+            let serialized = serde_json::to_string(&hint).unwrap();
+            assert_eq!(serialized, expected_json);
+            let deserialized: ContainerRuntimeHint = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, hint);
+        }
+    }
+
+    #[test]
+    fn remote_settings_accepts_container_runtime_field() {
+        let json = r#"{"container_runtime": "podman"}"#;
+        let content: RemoteSettingsContent = serde_json::from_str(json).unwrap();
+        assert_eq!(content.container_runtime, Some(ContainerRuntimeHint::Podman));
     }
 }
