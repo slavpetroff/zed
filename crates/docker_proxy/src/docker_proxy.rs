@@ -121,7 +121,9 @@ async fn proxy_connection(
         log::debug!("docker-proxy: connection copy ended: {error}");
     }
 
-    child.kill().ok();
+    if let Err(e) = child.kill() {
+        log::debug!("docker-proxy: failed to kill docker exec process: {e}");
+    }
     Ok(())
 }
 

@@ -316,40 +316,44 @@ pub async fn start_dev_container_with_config(
                 .unwrap_or_default();
             let specs = build_forward_specs(forward_ports);
             if !specs.is_empty() {
-                let current_exe = std::env::current_exe().unwrap_or_default();
-                let docker_cli = if context.use_podman { "podman" } else { "docker" };
-                let mut args = vec![
-                    "--docker-proxy".to_string(),
-                    "--docker-cli".to_string(),
-                    docker_cli.to_string(),
-                    "--container".to_string(),
-                    container_id.clone(),
-                ];
-                for (local, host, remote) in &specs {
-                    args.push("--docker-proxy-forward".to_string());
-                    args.push(format!("{local}:{host}:{remote}"));
-                }
-                let mut command = util::command::new_std_command(&current_exe);
-                command.args(&args);
-                match util::process::Child::spawn(
-                    command,
-                    std::process::Stdio::null(),
-                    std::process::Stdio::null(),
-                    std::process::Stdio::null(),
-                ) {
-                    Ok(mut child) => {
-                        log::info!(
-                            "devcontainer: started port forwarding for {} port(s)",
-                            specs.len()
-                        );
-                        // Detach the proxy: keep it running for the session.
-                        // smol::process::Child kills the process when dropped,
-                        // so we wait in a background task so the process is reaped
-                        // when it eventually exits (e.g. when the container stops).
-                        smol::spawn(async move { child.status().await.ok(); }).detach();
-                    }
+                match std::env::current_exe() {
                     Err(e) => {
-                        log::error!("devcontainer: failed to start port forwarding: {e:#}");
+                        log::error!("devcontainer: cannot start port forwarding: {e:#}");
+                    }
+                    Ok(current_exe) => {
+                        let docker_cli = if context.use_podman { "podman" } else { "docker" };
+                        let mut args = vec![
+                            "--docker-proxy".to_string(),
+                            "--docker-cli".to_string(),
+                            docker_cli.to_string(),
+                            "--container".to_string(),
+                            container_id.clone(),
+                        ];
+                        for (local, host, remote) in &specs {
+                            args.push("--docker-proxy-forward".to_string());
+                            args.push(format!("{local}:{host}:{remote}"));
+                        }
+                        let mut command = util::command::new_std_command(&current_exe);
+                        command.args(&args);
+                        match util::process::Child::spawn(
+                            command,
+                            std::process::Stdio::null(),
+                            std::process::Stdio::null(),
+                            std::process::Stdio::null(),
+                        ) {
+                            Ok(mut child) => {
+                                log::info!(
+                                    "devcontainer: started port forwarding for {} port(s)",
+                                    specs.len()
+                                );
+                                // smol::process::Child kills the process when dropped, so we
+                                // reap it in a background task rather than holding it alive here.
+                                smol::spawn(async move { child.status().await.ok(); }).detach();
+                            }
+                            Err(e) => {
+                                log::error!("devcontainer: failed to start port forwarding: {e:#}");
+                            }
+                        }
                     }
                 }
             }

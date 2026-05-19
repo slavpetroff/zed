@@ -1068,16 +1068,3 @@ impl dap::adapters::DapDelegate for DapAdapterDelegate {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn port_forwarding_mode_enum_variants_exist() {
-        use remote::PortForwardingMode;
-        assert!(matches!(PortForwardingMode::Inline, PortForwardingMode::Inline));
-        assert!(matches!(PortForwardingMode::Separate, PortForwardingMode::Separate));
-        assert!(matches!(
-            PortForwardingMode::SharedInterface,
-            PortForwardingMode::SharedInterface
-        ));
-    }
-}
