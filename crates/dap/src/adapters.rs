@@ -259,6 +259,40 @@ impl DebugAdapterBinary {
     }
 }
 
+/// Wraps a debug-adapter command so the in-container process reaps itself when
+/// its `docker exec` stdin reaches EOF.
+///
+/// `docker exec` does not forward signals to the in-container process when the
+/// local client is killed, but docker *does* close the in-container stdin
+/// stream. We run the real adapter under a tiny POSIX `sh` that blocks reading
+/// stdin; on EOF it `SIGTERM`s (then `SIGKILL`s) exactly the PID it launched.
+/// debugpy terminates its own debuggee on `SIGTERM`, so no process-group kill
+/// or `setsid` dependency is needed. Identity is intrinsic (`$!` inside this
+/// exec), so a session restart that reuses the same port cannot be cross-killed.
+///
+/// Invoked as `sh -c <LIFELINE> sh <program> <args…>` — argv is positional, so
+/// there is no shell-quoting or injection surface.
+pub fn wrap_with_stdin_lifeline(program: &str, args: &[String]) -> (String, Vec<String>) {
+    let mut wrapped = Vec::with_capacity(args.len() + 4);
+    wrapped.push("-c".to_string());
+    wrapped.push(LIFELINE.to_string());
+    wrapped.push("sh".to_string());
+    wrapped.push(program.to_string());
+    wrapped.extend(args.iter().cloned());
+    ("sh".to_string(), wrapped)
+}
+
+const LIFELINE: &str = concat!(
+    "\"$@\" &\n",
+    "child=$!\n",
+    "trap 'kill -TERM \"$child\" 2>/dev/null' EXIT\n",
+    "cat >/dev/null 2>&1\n",
+    "kill -TERM \"$child\" 2>/dev/null\n",
+    "i=0; while kill -0 \"$child\" 2>/dev/null && [ $i -lt 20 ]; ",
+    "do i=$((i+1)); sleep 0.1; done\n",
+    "kill -KILL \"$child\" 2>/dev/null\n",
+);
+
 #[derive(Debug, Clone)]
 pub struct AdapterVersion {
     pub tag_name: String,
@@ -542,5 +576,47 @@ mod tests {
         assert_eq!(conn.timeout, Some(2000));
         // port_forward_command is client-side only and must never appear in the proto
         assert!(round_tripped.port_forward_command.is_none());
+    }
+
+    #[test]
+    fn wrap_with_stdin_lifeline_runs_original_argv_under_sh() {
+        let (program, args) = wrap_with_stdin_lifeline(
+            "python",
+            &["-m".to_string(), "debugpy".to_string(), "--listen".to_string()],
+        );
+        assert_eq!(program, "sh");
+        assert_eq!(args[0], "-c");
+        // args[1] is the script; args[2] is $0 for `sh -c`.
+        assert_eq!(args[2], "sh");
+        assert_eq!(args[3], "python");
+        assert_eq!(
+            &args[4..],
+            &["-m".to_string(), "debugpy".to_string(), "--listen".to_string()]
+        );
+    }
+
+    #[test]
+    fn lifeline_is_posix_only_and_has_no_setsid_or_group_kill() {
+        let (_, args) = wrap_with_stdin_lifeline("p", &[]);
+        let script = &args[1];
+        assert!(!script.contains("setsid"), "no setsid dependency: {script}");
+        assert!(
+            !script.contains("kill -TERM -\"") && !script.contains("kill -KILL -\""),
+            "no negative-PID process-group kill: {script}"
+        );
+        assert!(script.contains("cat >/dev/null"), "{script}");
+        assert!(script.contains("kill -TERM \"$child\""), "{script}");
+        assert!(script.contains("kill -KILL \"$child\""), "{script}");
+        assert!(script.contains("[ $i -lt 20 ]"), "bounded grace: {script}");
+    }
+
+    #[test]
+    fn lifeline_arms_exit_trap_backstop() {
+        let (_, args) = wrap_with_stdin_lifeline("p", &[]);
+        assert!(
+            args[1].contains("trap 'kill -TERM \"$child\" 2>/dev/null' EXIT"),
+            "{}",
+            args[1]
+        );
     }
 }
