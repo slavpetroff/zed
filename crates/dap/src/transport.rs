@@ -476,6 +476,7 @@ pub struct TcpTransport {
     pub timeout: u64,
     process: Arc<Mutex<Option<Child>>>,
     port_forward_process: Option<Child>,
+    adapter_stdin: Option<smol::process::ChildStdin>,
     _stderr_task: Option<Task<()>>,
     _stdout_task: Option<Task<()>>,
 }
@@ -525,6 +526,7 @@ impl TcpTransport {
         let mut process = None;
         let mut stdout_task = None;
         let mut stderr_task = None;
+        let mut adapter_stdin = None;
 
         if let Some(command) = &binary.command {
             let mut command = util::command::new_std_command(&command);
@@ -536,8 +538,19 @@ impl TcpTransport {
             command.args(&binary.arguments);
             command.envs(&binary.envs);
 
-            let mut p = Child::spawn(command, Stdio::null(), Stdio::piped(), Stdio::piped())
+            // The docker DAP path holds the adapter's `docker exec` stdin open
+            // and drops it on kill()/Drop, so the in-container lifeline wrapper
+            // sees EOF and reaps itself. Non-docker keeps Stdio::null().
+            let stdin_mode = if binary.port_forward_command.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            };
+
+            let mut p = Child::spawn(command, stdin_mode, Stdio::piped(), Stdio::piped())
                 .with_context(|| "failed to start debug adapter.")?;
+
+            adapter_stdin = p.stdin.take();
 
             stdout_task = p.stdout.take().map(|stdout| {
                 cx.background_executor()
@@ -574,6 +587,7 @@ impl TcpTransport {
             host,
             process: Arc::new(Mutex::new(process)),
             port_forward_process,
+            adapter_stdin,
             timeout,
             _stdout_task: stdout_task,
             _stderr_task: stderr_task,
@@ -589,6 +603,11 @@ impl Transport for TcpTransport {
     }
 
     fn kill(&mut self) {
+        // Close the adapter's docker-exec stdin first: the in-container
+        // lifeline wrapper reaps itself (and, via debugpy, its debuggee) on
+        // stdin-EOF. Doing this before killing the local clients ensures the
+        // in-container process is gone before a restart reuses the port.
+        drop(self.adapter_stdin.take());
         if let Some(mut proxy) = self.port_forward_process.take() {
             proxy.kill().log_err();
         }
@@ -657,6 +676,9 @@ impl Transport for TcpTransport {
 
 impl Drop for TcpTransport {
     fn drop(&mut self) {
+        // See kill(): close the docker-exec stdin first so the in-container
+        // lifeline reaps on EOF before the local clients are killed.
+        drop(self.adapter_stdin.take());
         if let Some(mut proxy) = self.port_forward_process.take() {
             proxy.kill().log_err();
         }
@@ -1044,6 +1066,10 @@ impl TcpTransport {
     fn has_port_forward_sidecar(&self) -> bool {
         self.port_forward_process.is_some()
     }
+
+    fn has_adapter_stdin(&self) -> bool {
+        self.adapter_stdin.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -1117,6 +1143,72 @@ mod tests {
         assert!(
             !transport.has_port_forward_sidecar(),
             "port_forward_process must be None when no port_forward_command is given"
+        );
+    }
+
+    fn binary_with_command_and_sidecar(
+        command: Option<String>,
+        port_forward_command: Option<CommandTemplate>,
+    ) -> DebugAdapterBinary {
+        DebugAdapterBinary {
+            command,
+            arguments: vec![],
+            envs: Default::default(),
+            cwd: None,
+            connection: Some(TcpArguments {
+                host: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 9999,
+                timeout: Some(100),
+            }),
+            request_args: StartDebuggingRequestArguments {
+                configuration: serde_json::Value::Null,
+                request: StartDebuggingRequestArgumentsRequest::Attach,
+            },
+            port_forward_command,
+        }
+    }
+
+    #[gpui::test]
+    async fn tcp_transport_pipes_adapter_stdin_when_forwarding(cx: &mut TestAppContext) {
+        let binary = binary_with_command_and_sidecar(
+            Some("/bin/cat".to_string()),
+            Some(CommandTemplate {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "".to_string()],
+                env: Default::default(),
+            }),
+        );
+
+        let mut async_cx = cx.to_async();
+        let mut transport = TcpTransport::start(&binary, Default::default(), &mut async_cx)
+            .await
+            .unwrap();
+
+        assert!(
+            transport.has_adapter_stdin(),
+            "docker adapter (port_forward_command Some) must have a piped stdin handle"
+        );
+
+        transport.kill();
+
+        assert!(
+            !transport.has_adapter_stdin(),
+            "kill() must drop the adapter stdin handle (triggers in-container EOF)"
+        );
+    }
+
+    #[gpui::test]
+    async fn tcp_transport_no_adapter_stdin_without_forwarding(cx: &mut TestAppContext) {
+        let binary = binary_with_command_and_sidecar(Some("/bin/cat".to_string()), None);
+
+        let mut async_cx = cx.to_async();
+        let transport = TcpTransport::start(&binary, Default::default(), &mut async_cx)
+            .await
+            .unwrap();
+
+        assert!(
+            !transport.has_adapter_stdin(),
+            "non-docker adapter must keep Stdio::null() stdin (no handle)"
         );
     }
 }
