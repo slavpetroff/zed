@@ -9,14 +9,17 @@ use futures::TryFutureExt;
 use gpui::{AsyncWindowContext, Entity};
 use project::Worktree;
 use serde::Deserialize;
-use settings::{DevContainerConnection, infer_json_indent_size, replace_value_in_json_text};
+use settings::{
+    ContainerRuntimeHint, DevContainerConnection, infer_json_indent_size,
+    replace_value_in_json_text,
+};
 use util::rel_path::RelPath;
 use walkdir::WalkDir;
 use workspace::Workspace;
 use worktree::Snapshot;
 
 use crate::{
-    DevContainerContext, DevContainerFeature, DevContainerTemplate,
+    ContainerRuntime, DevContainerContext, DevContainerFeature, DevContainerTemplate,
     devcontainer_json::{DevContainer, ForwardPort},
     devcontainer_manifest::{read_devcontainer_configuration, spawn_dev_container},
     devcontainer_templates_repository, get_latest_oci_manifest, get_oci_token, ghcr_registry,
@@ -368,18 +371,50 @@ pub async fn start_dev_container_with_config(
     }
 }
 
-async fn check_for_docker(use_podman: bool) -> Result<(), DevContainerError> {
-    let mut command = if use_podman {
-        util::command::new_command("podman")
+async fn probe_cli(cli: &str) -> Result<(), DevContainerError> {
+    log::debug!("devcontainer: probing {} daemon", cli);
+    let output = util::command::new_command(cli)
+        .args(["ps", "-q"])
+        .output()
+        .await
+        .map_err(|e| {
+            log::warn!("devcontainer: {} not accessible: {e:#}", cli);
+            DevContainerError::DockerNotAvailable
+        })?;
+    if output.status.success() {
+        Ok(())
     } else {
-        util::command::new_command("docker")
-    };
-    command.arg("--version");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::warn!("devcontainer: {} not accessible: {}", cli, stderr.trim());
+        Err(DevContainerError::DockerNotAvailable)
+    }
+}
 
-    match command.output().await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            log::error!("Unable to find docker in $PATH: {:?}", e);
+pub(crate) async fn resolve_container_cli(
+    hint: ContainerRuntimeHint,
+) -> Result<ContainerRuntime, DevContainerError> {
+    match hint {
+        ContainerRuntimeHint::Docker => {
+            probe_cli("docker").await?;
+            log::info!("devcontainer: using docker");
+            Ok(ContainerRuntime::Docker)
+        }
+        ContainerRuntimeHint::Podman => {
+            probe_cli("podman").await?;
+            log::info!("devcontainer: using podman");
+            Ok(ContainerRuntime::Podman)
+        }
+        ContainerRuntimeHint::Auto => {
+            if probe_cli("docker").await.is_ok() {
+                log::info!("devcontainer: using docker");
+                return Ok(ContainerRuntime::Docker);
+            }
+            log::warn!("devcontainer: docker not accessible, trying podman");
+            if probe_cli("podman").await.is_ok() {
+                log::info!("devcontainer: using podman");
+                return Ok(ContainerRuntime::Podman);
+            }
+            log::error!("devcontainer: no container runtime found (tried docker and podman)");
             Err(DevContainerError::DockerNotAvailable)
         }
     }
