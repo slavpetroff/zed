@@ -55,6 +55,25 @@ use task::{DebugScenario, SharedTaskContext, SpawnInTerminal, TaskTemplate};
 use util::{ResultExt as _, rel_path::RelPath};
 use worktree::Worktree;
 
+/// Decides the adapter `(program, args)` for a forwarding mode. In docker
+/// (`Separate`) mode the adapter is wrapped in a stdin-EOF lifeline so the
+/// in-container process reaps itself when its `docker exec` stdin closes.
+/// Other modes (and a `None` program — a shell adapter) pass through unchanged.
+fn adapter_command_for_forwarding(
+    command: Option<String>,
+    arguments: Vec<String>,
+    forwarding_mode: PortForwardingMode,
+) -> (Option<String>, Vec<String>) {
+    match (command, forwarding_mode) {
+        (Some(program), PortForwardingMode::Separate) => {
+            let (program, args) =
+                dap::adapters::wrap_with_stdin_lifeline(&program, &arguments);
+            (Some(program), args)
+        }
+        (command, _) => (command, arguments),
+    }
+}
+
 #[derive(Debug)]
 pub enum DapStoreEvent {
     DebugClientStarted(SessionId),
@@ -329,7 +348,7 @@ impl DapStore {
 
                     if let Some(c) = binary.connection {
                         let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
-                        match forwarding_mode {
+                        match &forwarding_mode {
                             PortForwardingMode::SharedInterface => {
                                 port_forwarding_inline = None;
                                 port_forward_command = None;
@@ -373,10 +392,17 @@ impl DapStore {
                         connection = None;
                     }
 
+                    let (adapter_command, adapter_arguments) =
+                        adapter_command_for_forwarding(
+                            binary.command,
+                            binary.arguments,
+                            forwarding_mode,
+                        );
+
                     let command = remote.read_with(cx, |remote, _cx| {
                         remote.build_command_with_options(
-                            binary.command,
-                            &binary.arguments,
+                            adapter_command,
+                            &adapter_arguments,
                             &binary.envs,
                             binary.cwd.map(|path| path.display().to_string()),
                             port_forwarding_inline,
@@ -1065,6 +1091,53 @@ impl dap::adapters::DapDelegate for DapAdapterDelegate {
 
     fn is_headless(&self) -> bool {
         self.is_headless
+    }
+}
+
+#[cfg(test)]
+mod lifeline_wiring_tests {
+    use super::adapter_command_for_forwarding;
+    use remote::PortForwardingMode;
+
+    #[test]
+    fn separate_mode_wraps_the_adapter_command() {
+        let (program, args) = adapter_command_for_forwarding(
+            Some("python".to_string()),
+            vec!["-m".to_string(), "debugpy".to_string()],
+            PortForwardingMode::Separate,
+        );
+        assert_eq!(program.as_deref(), Some("sh"));
+        assert_eq!(args[0], "-c");
+        assert_eq!(args[2], "sh");
+        assert_eq!(args[3], "python");
+        assert_eq!(&args[4..], &["-m".to_string(), "debugpy".to_string()]);
+    }
+
+    #[test]
+    fn inline_and_shared_modes_do_not_wrap() {
+        for mode in [
+            PortForwardingMode::Inline,
+            PortForwardingMode::SharedInterface,
+        ] {
+            let (program, args) = adapter_command_for_forwarding(
+                Some("python".to_string()),
+                vec!["-m".to_string()],
+                mode,
+            );
+            assert_eq!(program.as_deref(), Some("python"));
+            assert_eq!(args, vec!["-m".to_string()]);
+        }
+    }
+
+    #[test]
+    fn separate_mode_with_no_command_passes_through() {
+        let (program, args) = adapter_command_for_forwarding(
+            None,
+            vec!["shell-arg".to_string()],
+            PortForwardingMode::Separate,
+        );
+        assert_eq!(program, None);
+        assert_eq!(args, vec!["shell-arg".to_string()]);
     }
 }
 
