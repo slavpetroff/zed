@@ -30,8 +30,8 @@
 //! ```
 
 use crate::remote_client::{
-    ChannelClient, CommandTemplate, Interactive, RemoteClientDelegate,
-    RemoteConnection, RemoteConnectionOptions,
+    ChannelClient, CommandTemplate, Interactive, RemoteClientDelegate, RemoteConnection,
+    RemoteConnectionOptions,
 };
 use anyhow::Result;
 use async_trait::async_trait;
