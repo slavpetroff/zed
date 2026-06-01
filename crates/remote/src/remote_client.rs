@@ -1573,7 +1573,7 @@ type ResponseChannels = Mutex<HashMap<MessageId, oneshot::Sender<(Envelope, ones
 type StreamResponseChannels =
     Arc<Mutex<HashMap<MessageId, UnboundedSender<(Result<Envelope>, oneshot::Sender<()>)>>>>;
 
-struct Signal<T> {
+struct Signal<T: 'static> {
     tx: Mutex<Option<oneshot::Sender<T>>>,
     rx: Shared<Task<Option<T>>>,
 }
