@@ -274,6 +274,7 @@ impl CommitView {
                 window,
                 cx,
             );
+            editor.disable_diff_hunk_controls(cx);
 
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_show_bookmarks(false, cx);
@@ -323,7 +324,9 @@ impl CommitView {
                             .or(first_worktree_id)
                     })
                     .context("project has no worktrees")?;
-                let short_sha = commit_sha.get(0..7).unwrap_or(&commit_sha);
+                let short_sha = commit_sha
+                    .get(0..git::SHORT_SHA_LENGTH)
+                    .unwrap_or(&commit_sha);
                 let file_name = file
                     .path
                     .file_name()
@@ -1189,6 +1192,7 @@ impl Item for CommitView {
                         window,
                         cx,
                     );
+                    editor.disable_diff_hunk_controls(cx);
                     editor.rhs_editor().update(cx, |editor, cx| {
                         editor.set_show_bookmarks(false, cx);
                         editor.set_show_breakpoints(false, cx);
