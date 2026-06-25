@@ -333,6 +333,10 @@ impl TemplatePickerDelegate {
 impl PickerDelegate for TemplatePickerDelegate {
     type ListItem = AnyElement;
 
+    fn name() -> &'static str {
+        "dev container template picker"
+    }
+
     fn match_count(&self) -> usize {
         self.matching_indices.len()
     }
@@ -515,6 +519,10 @@ impl FeaturePickerDelegate {
 
 impl PickerDelegate for FeaturePickerDelegate {
     type ListItem = AnyElement;
+
+    fn name() -> &'static str {
+        "dev container feature picker"
+    }
 
     fn match_count(&self) -> usize {
         self.matching_indices.len()
@@ -1206,8 +1214,7 @@ impl StatefulModal for DevContainerModal {
                         }),
                     );
 
-                    let picker =
-                        cx.new(|cx| Picker::uniform_list(delegate, window, cx).modal(false));
+                    let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx).embedded());
                     self.picker = Some(picker);
                     Some(DevContainerState::TemplateQueryReturned(Ok(items)))
                 } else {
@@ -1338,8 +1345,7 @@ impl StatefulModal for DevContainerModal {
                         }),
                     );
 
-                    let picker =
-                        cx.new(|cx| Picker::uniform_list(delegate, window, cx).modal(false));
+                    let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx).embedded());
                     self.features_picker = Some(picker);
                     Some(DevContainerState::FeaturesQueryReturned(template_entry))
                 } else {
